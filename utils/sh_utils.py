@@ -360,7 +360,7 @@ import pyshtools as pysh
 def rotateSH(sh_input, rot_angle, rot_axis):
     ls = np.array([0, 1, 1, 1, 2, 2, 2, 2, 2])
     ms = np.array([0, -1, 0, 1, -2, -1, 0, 1, 2])
-    mneg_mask = (ms < 0).astype(np.int)
+    mneg_mask = (ms < 0).astype(np.int64)
 
     # (csphase=1 => exclude)
     __OUR_SH_CSPHASE = 1

@@ -393,7 +393,7 @@ class GaussianHeadModel(GaussianModel):
             
     def load_model(self, path):
         super().load_ply(os.path.join(path,"point_cloud.ply"))
-        atrributes_params_dict=torch.load(os.path.join(path,"attributes_params.pth"),map_location="cpu")
+        atrributes_params_dict=torch.load(os.path.join(path,"attributes_params.pth"),map_location="cpu", weights_only=False)
         
         self.flame_scale=nn.Parameter(atrributes_params_dict["flame_scale"].to(self.device),requires_grad=True)
         self.flame_vertexes=nn.Parameter(atrributes_params_dict["flame_vertexes"].to(self.device),requires_grad=False)
@@ -421,7 +421,7 @@ class GaussianHeadModel(GaussianModel):
 
         
         if  self.with_param_net_smirk:
-            statedict=torch.load( os.path.join(path,"flame_params_net.pth"),map_location="cpu")
+            statedict=torch.load( os.path.join(path,"flame_params_net.pth"),map_location="cpu", weights_only=False)
             self.flame_params_net.load_state_dict(statedict)
             self.flame_params_net.to(self.device)
         
