@@ -72,8 +72,12 @@ are mutually exclusive.
   `preprocess/submodules/DECA/decalib/deca.py` — explicit
   `weights_only=False` on `torch.load` calls that unpickle arbitrary
   Python objects (required since PyTorch 2.6 flipped the default).
-* `net_modules/flame_params_net_smirk.py` — explicit `weights_only=True`
-  where only tensors are loaded.
+* `net_modules/flame_params_net_smirk.py` — explicit
+  `weights_only=False` on `torch.load` for `SMIRK_em1.pt` (and any
+  fine-tuned checkpoint).  The SMIRK weights were produced under a
+  pre-2.x PyTorch and although the HRAvatar-consumed state dict is
+  tensors-only, we do not want to risk the default `weights_only=True`
+  failing on a legacy asset we cannot regenerate.
 
 These are intentionally the minimum set of patches; no functional changes.
 
@@ -92,9 +96,15 @@ These are intentionally the minimum set of patches; no functional changes.
 * `demos/demo_2_cross_reenactment.sh`      — NEW.  Offline feature
   extraction (DECA) + cross-reenactment with `render.py
   --corss_source_paths`.
-* `demos/demo_3_overlay_tracking.py`       — NEW.  Offline
-  detect-extract-overlay using DECA + face-alignment; no HRAvatar model
-  required.
+* `demos/demo_3_overlay_tracking.py`       — NEW.  Offline **feature
+  inspector** for the tensors HRAvatar's renderer actually consumes:
+  reads `tracked_params.json` (post-`optimize.py`), re-runs the same
+  LBS + offset chain as `GaussianHeadModel.lbs_v2` (including the
+  6-joint augmentation and the zero-column `lbs_weights` pad from
+  `scene/__init__.py`), projects with the exact camera built by
+  `data_loader._load_camera`, and overlays vertices / landmarks /
+  params summary on the source frames.  No HRAvatar checkpoint is
+  loaded — intended for downstream Listening-Head-Generation models.
 * `UPGRADE_NOTES.md`                       — THIS FILE.
 
 ## Quick start

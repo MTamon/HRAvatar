@@ -7,7 +7,7 @@ MTamon branches (`MTamon/DECA@release/cuda128`, `MTamon/smirk@release/cuda128`).
 |---|-------------------------------------|-------------------------------------------------------------------------|
 | 1 | `demo_1_train_subject.sh`           | End-to-end training of HRAvatar on a single subject's video.            |
 | 2 | `demo_2_cross_reenactment.sh`       | Drive a trained HRAvatar with a **different** person's extracted FLAME. |
-| 3 | `demo_3_overlay_tracking.py`        | Overlay the tracked FLAME mesh / landmarks on the source video.         |
+| 3 | `demo_3_overlay_tracking.py`        | Visualize the **post-optimize** features HRAvatar's renderer actually receives (FLAME vertices + landmarks + params card), overlaid on the source frames. |
 
 All three demos assume `bash setup.sh` and `bash download_assets.sh` have
 been executed successfully and `conda activate HRAvatar` is live.
@@ -110,25 +110,49 @@ outputs/custom/bob/test_cross_reenactment/ours_<N>/alice_reenactment_bob/
 └── alice_reenactment_bob_video.mp4
 ```
 
-## 3. Overlay detection / tracking on a video
+## 3. Visualize HRAvatar's actual renderer input
 
 `demos/demo_3_overlay_tracking.py`
 
-This is an **offline** tool — no HRAvatar model is loaded.  It detects faces
-frame-by-frame, extracts features (FLAME parameters with DECA, or 68-point
-landmarks with face-alignment, or both), renders the result on top of the
-original frame, and writes an mp4.
+This is the **offline feature inspector**.  Use it to verify that a
+downstream Listening-Head-Generation model is producing the exact feature
+shape HRAvatar's renderer expects.
 
-Yes, this is possible — it re-uses the already-installed DECA + face-alignment
-+ (optionally) MediaPipe stack.  The reference for the overlay style is
-`MTamon/smirk/blob/release/cuda128/demos/demo_video.py`'s `--overlay` flag.
+Important: the features HRAvatar ingests are **not** raw DECA output —
+they come from `preprocess/submodules/DECA/optimize.py`, a photometric
++ landmark + temporal refinement whose result is stored in
+`tracked_params.json`.  The demo:
+
+1. reads `tracked_params.json` produced by the preprocessing pipeline;
+2. re-implements the same LBS + offset chain HRAvatar uses internally
+   (`scene.gaussian_head_model.GaussianHeadModel.lbs_v2`, including
+   the `num_joints = J_regressor.shape[1] + 1` 6-joint augmentation and
+   the `lbs_weights` zero-column pad from `scene/__init__.py`);
+3. projects the resulting vertices with exactly the camera the data
+   loader builds (`w2c = diag(1,-1,-1,1) @ world_mat`, pinhole
+   `fo = image_w / (2·tan(½·fovx))` with `fovx = 2·arctan2(cx, fx)`);
+4. overlays the result on the original frames and writes an mp4.
+
+No HRAvatar checkpoint is loaded — only the FLAME assets installed via
+`download_assets.sh`.  If the overlay tracks the input here, HRAvatar
+will reproduce it.
 
 ```bash
+# 1) preprocess once (reuse the helper used by demo 1)
+bash demos/_preprocess_subject.sh /data/subjects alice /data/raw/alice.mp4 hdtf
+
+# 2) inspect the features fed to the renderer
 python demos/demo_3_overlay_tracking.py \
-    --input  /data/raw/alice.mp4 \
-    --output /tmp/alice_overlay.mp4 \
-    --mode   flame_mesh            # flame_mesh | landmarks | both
+    --subject_dir /data/subjects/alice \
+    --output      /tmp/alice_features.mp4 \
+    --mode        all
 ```
 
-See the command-line `--help` for the full flag set (`--alpha`,
-`--fps`, `--max_frames`, `--device`, `--no_crop`, ...).
+Modes: `vertices` (cyan dots at every projected FLAME vertex),
+`wireframe` (triangle edges), `landmarks` (the 68-pt FAN points the
+optimiser was fit against, read from `keypoint.json`), `params_card`
+(numerical summary of `shape[:6]`, `exp[:6]`, global/neck/jaw pose in
+degrees, eyelids, translation), `all` (vertices + landmarks + card).
+
+The overlay style mirrors
+`MTamon/smirk@release/cuda128/demos/demo_video.py --show_vertices`.

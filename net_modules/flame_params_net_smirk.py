@@ -66,7 +66,7 @@ class FlameParamsNetSmirk(nn.Module):
         return self.expression_encoder(img)
         
     def load_initial_state(self):
-        checkpoint = torch.load(self.model_path, weights_only=True)
+        checkpoint = torch.load(self.model_path, weights_only=False)
         checkpoint_expression = {k.replace('smirk_encoder.expression_encoder.', ''): v for k, v in checkpoint.items() \
                                          if 'smirk_encoder.expression_encoder' in k}
         checkpoint_expression_encoder={k.replace('encoder.', ''): v for k, v in checkpoint_expression.items() \
@@ -81,7 +81,7 @@ class FlameParamsNetSmirk(nn.Module):
         if state==0:
             self._state_dict=self.expression_encoder.state_dict()
             if ckpt_path is not None:
-                ckpt_state=torch.load(ckpt_path, weights_only=True)
+                ckpt_state=torch.load(ckpt_path, weights_only=False)
                 self.load_state_dict(ckpt_state)
             else:        
                 self.load_initial_state()

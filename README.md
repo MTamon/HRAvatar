@@ -191,18 +191,25 @@ SMIRK is wired as an *online* expression encoder inside HRAvatar via
 `--with_param_net_smirk`; see [`demos/demo_2_cross_reenactment.sh`](demos/demo_2_cross_reenactment.sh)
 for how to plug in a SMIRK-produced trajectory.
 
-### 3. Overlay detection / tracking on a video
-Offline frame-by-frame face detection → DECA FLAME extraction → mesh
-overlay on the original frames.  No HRAvatar model is required; only
-the DECA + face-alignment stack installed by `setup.sh`:
+### 3. Visualize HRAvatar's actual renderer input
+Reads `tracked_params.json` produced by the preprocessing pipeline
+(i.e. the **post-optimize** features — after DECA's raw output is
+refined by `optimize.py` against 2D landmarks, iris and a photometric
+objective), poses the FLAME mesh with exactly the same LBS chain HRAvatar
+uses at inference, projects with exactly the same camera the data loader
+builds, and overlays the result on the original frames.  No HRAvatar
+checkpoint is loaded — this is a feature inspector for downstream
+Listening-Head-Generation models that want to produce these tensors.
 ```shell
+bash demos/_preprocess_subject.sh /data/subjects alice /data/raw/alice.mp4 hdtf
 python demos/demo_3_overlay_tracking.py \
-       --input  /data/raw/alice.mp4 \
-       --output /tmp/alice_overlay.mp4 \
-       --mode   flame_mesh
+       --subject_dir /data/subjects/alice \
+       --output      /tmp/alice_features.mp4 \
+       --mode        all
 ```
-Modes: `flame_mesh`, `landmarks`, `both`.  Overlay style follows
-[`MTamon/smirk@release/cuda128/demos/demo_video.py`](https://github.com/MTamon/smirk/blob/release/cuda128/demos/demo_video.py).
+Modes: `vertices`, `wireframe`, `landmarks`, `params_card`, `all`.
+Overlay style follows
+[`MTamon/smirk@release/cuda128/demos/demo_video.py --show_vertices`](https://github.com/MTamon/smirk/blob/release/cuda128/demos/demo_video.py).
 
 
 ## 🎨 Rendering
