@@ -160,9 +160,22 @@ def auto_downsample_ratio(h, w):
 class Converter:
     def __init__(self, variant: str, checkpoint: str, device: str):
         self.model = MattingNetwork(variant).eval().to(device)
-        self.model.load_state_dict(torch.load(checkpoint, map_location=device))
-        self.model = torch.jit.script(self.model)
-        self.model = torch.jit.freeze(self.model)
+        # `weights_only=False` — rvm_resnet50.pth is a legacy checkpoint
+        # pickled under PyTorch 1.x; it is tensors-only in practice but
+        # we explicitly opt out of the new 2.6+ weights_only=True default
+        # so subtle pickle-globals mismatches do not break loading.
+        self.model.load_state_dict(
+            torch.load(checkpoint, map_location=device, weights_only=False)
+        )
+        # torch.jit.script + freeze are speed-only optimisations and break
+        # on modern PyTorch when the scripted model's type inference fails.
+        # Fall back to the eager model on any JIT error.
+        try:
+            scripted = torch.jit.script(self.model)
+            self.model = torch.jit.freeze(scripted)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[rvm] torch.jit.script failed ({type(exc).__name__}: {exc}); "
+                  f"falling back to the eager model.")
         self.device = device
     
     def convert(self, *args, **kwargs):

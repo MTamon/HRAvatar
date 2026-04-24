@@ -62,7 +62,7 @@ def evaluate(respth='./res/test_res', dspth='./data', cp='model_final_diss.pth')
     net.cuda()
     file_path=os.path.dirname(os.path.abspath(__file__))
     save_pth = osp.join(file_path,'res/cp', cp)
-    net.load_state_dict(torch.load(save_pth))
+    net.load_state_dict(torch.load(save_pth, weights_only=False))
     net.eval()
 
     to_tensor = transforms.Compose([

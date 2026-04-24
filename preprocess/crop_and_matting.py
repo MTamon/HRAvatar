@@ -15,6 +15,25 @@ from tqdm import tqdm
 from utils.general_utils import natural_sort_key
 
 
+def _decode_bytes(b):
+    try:
+        return b.decode('utf-8')
+    except UnicodeDecodeError:
+        return b.decode('latin1', errors='replace')
+
+
+def _print_subprocess_output(stdout, stderr, tag, returncode):
+    """Print both stdout and stderr from a preprocessing subprocess.
+    Errors from RobustVideoMatting / face-parsing / etc. were previously
+    swallowed, producing confusing `assert len(images)==len(masks)` crashes
+    downstream.  Always show them."""
+    if stdout:
+        print(f"[{tag} stdout]\n{_decode_bytes(stdout)}")
+    if stderr:
+        print(f"[{tag} stderr]\n{_decode_bytes(stderr)}")
+    print(f"[{tag}] returncode={returncode}")
+
+
 def get_bbox(image, lmks, bb_scale=2.0):
     h, w, c = image.shape
     lmks = lmks.astype(np.int32)
@@ -105,7 +124,12 @@ class Crop_and_matting(Dataset, ABC):
     def change_file_name(self,image_path,save_path):
         images = sorted(glob(f'{image_path}/*.jpg') + glob(f'{image_path}/*.png'),key=natural_sort_key)
         masks = sorted(glob(f'{save_path}/*.png')+ glob(f'{save_path}/*.jpg'),key=natural_sort_key)
-        assert len(images)==len(masks)
+        if len(images) != len(masks):
+            raise RuntimeError(
+                f"mask count mismatch: {len(images)} images vs {len(masks)} masks. "
+                f"The matting subprocess likely failed — re-run crop_and_matting.py "
+                f"and watch for the `[rvm stderr]` block printed by robust_video_matting()."
+            )
         
         file_type=masks[0].split(".")[-1]
         for i in range(len(images)):
@@ -113,7 +137,6 @@ class Crop_and_matting(Dataset, ABC):
             os.rename(masks[i],os.path.join(save_path,image_name+"."+file_type))
             
     def robust_video_matting(self,image_path,save_path):
-        #save_video_file=os.path.join(os.path.dirname(save_path),self.name+'_matted.mp4')
         import subprocess
         print(f"face masking...{image_path}")
         command = [
@@ -126,20 +149,12 @@ class Crop_and_matting(Dataset, ABC):
             '--output-alpha', save_path,
             '--output-type', 'png_sequence'
         ]
-        # subprocess.run(command, capture_output=True, text=True)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
         stdout, stderr = process.communicate()
-        try:
-            print(stdout.decode('utf-8'))
-        except UnicodeDecodeError:
-            print(stdout.decode('latin1'))
-        
-        #resnet50 mobilenetv3
-        # model = torch.hub.load("PeterL1n/RobustVideoMatting", "resnet50").cuda()
-        # convert_video = torch.hub.load("PeterL1n/RobustVideoMatting", "converter")
-        # print("Finish face masking...")
-        # convert_video(model,image_path,output_type= 'png_sequence',output_alpha=save_path)
-        
+        _print_subprocess_output(stdout, stderr, "rvm", process.returncode)
+        if process.returncode != 0:
+            raise RuntimeError(f"RobustVideoMatting inference.py exited with code {process.returncode}")
+
         self.change_file_name(image_path,save_path)
 
     
@@ -152,13 +167,11 @@ class Crop_and_matting(Dataset, ABC):
             "--dspth",image_path,
             "--respth",save_path
         ]
-        # subprocess.run(command, capture_output=True, text=True)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
         stdout, stderr = process.communicate()
-        try:
-            print(stdout.decode('utf-8'))
-        except UnicodeDecodeError:
-            print(stdout.decode('latin1'))
+        _print_subprocess_output(stdout, stderr, "face-parsing", process.returncode)
+        if process.returncode != 0:
+            raise RuntimeError(f"face-parsing test.py exited with code {process.returncode}")
         print("Finish face parsing.")
     
     def merge_maks(self,image_path,mask_path,seg_path):
