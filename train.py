@@ -51,7 +51,7 @@ def training(all_args, testing_epochs, saving_epochs, checkpoint_epochs, checkpo
         [i*train_dataset.data_len for i in testing_epochs],[i*train_dataset.data_len for i in checkpoint_epochs]
         
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, all_args)
     device = gaussians.device
     

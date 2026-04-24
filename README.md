@@ -49,6 +49,16 @@ git clone https://github.com/Pixel-Talk/HRAvatar.git
 
 The components have been tested on Ubuntu Linux 20.04. Instructions for setting up and running each of them are in the below sections.
 
+> ### 🔁 Python 3.11 + PyTorch 2.9 + CUDA 12.8 port
+> This branch ports HRAvatar to **Python 3.11 / PyTorch 2.9.1 / CUDA 12.8**.
+> The pin set is aligned with the companion
+> [MTamon/DECA@release/cuda128](https://github.com/MTamon/DECA/tree/release/cuda128),
+> [MTamon/smirk@release/cuda128](https://github.com/MTamon/smirk/tree/release/cuda128)
+> and [MTamon/FLARE](https://github.com/MTamon/FLARE) forks.
+> See [`UPGRADE_NOTES.md`](UPGRADE_NOTES.md) for the full changelog and
+> library-by-library rationale, and [`demos/README.md`](demos/README.md)
+> for the three new demo scripts.
+
 ## 📂 Datasets preparation
 Download the insta dataset (already with extracted mask) from [INSTA](https://github.com/Zielon/INSTA). The dataset can be accessed [here](https://keeper.mpdl.mpg.de/d/5ea4d2c300e9444a8b0b/).
 
@@ -71,21 +81,26 @@ The optimizer uses PyTorch and CUDA extensions in a Python environment to produc
 
 #### Software Requirements
 - Conda (recommended for easy setup)
-- C++ Compiler for PyTorch extensions (we used VS Code)
-- CUDA SDK 11 for PyTorch extensions (we used 11.7)
-- C++ Compiler and CUDA SDK must be compatible
+- gcc-11 / g++-11 (or clang equivalent) for PyTorch extensions
+- CUDA 12.8 SDK for PyTorch extensions
+- C++ compiler and CUDA SDK must be compatible
 
 ### Environment Setup
-Our default, provided install method is based on Conda package and environment management:
 ```shell
-conda env create --file environment.yml
-conda activate HRAvatar
-cd submodules
-git clone https://github.com/NVlabs/nvdiffrast.git
-pip install nvdiffrast
-pip install diff-gaussian-rasterization_c10
-pip install simple-knn
+# 1. Create the conda env, install torch 2.9.1+cu128, build local extensions.
+bash setup.sh
+
+# 2. Download required third-party weights (FLAME / DECA / SMIRK / RVM / ...).
+bash download_assets.sh
 ```
+`setup.sh` follows the [`install_128.sh`](https://github.com/MTamon/DECA/blob/release/cuda128/install_128.sh)
+pattern used by the MTamon/DECA and MTamon/smirk cuda128 branches: it
+upgrades pip to 25.2, installs torch/vision from the
+`https://download.pytorch.org/whl/cu128` index, and installs the pin set
+in `requirements.txt` with `--no-deps` so that transitive resolution
+cannot perturb the library versions.  `diff-gaussian-rasterization_c10`,
+`simple-knn`, `nvdiffrast`, and `pytorch3d@v0.7.8` are built from source
+against PyTorch 2.9.1.
 
 ## 🔧 Data Preprocessing
 
@@ -144,6 +159,57 @@ CUDA_VISIBLE_DEVICES=0  python train.py --source_path /path/to/subject \
   --expression_dirs_lr 1e-7 --pose_dirs_lr 1e-7 --shape_dirs_lr 1e-8 \
   --position_lr_init 5e-5 --position_lr_final 5e-7
 ```
+
+## 🎬 Demos
+
+Three end-to-end demos are provided under [`demos/`](demos/README.md).
+Each demo is self-contained: it runs the full preprocessing pipeline
+(or re-uses an already-preprocessed subject), invokes the appropriate
+`train.py` / `render.py` command, and leaves the outputs in a predictable
+directory.
+
+### 1. Train on a new subject
+Runs frame extraction, DECA FLAME estimation, keypoint detection, iris
+segmentation, photometric FLAME optimisation and HRAvatar training:
+```shell
+bash demos/demo_1_train_subject.sh \
+     /data/subjects alice /data/raw/alice.mp4 hdtf
+```
+
+### 2. Offline cross-reenactment
+Extracts features (shape + pose + expression) from a *source* subject's
+video with DECA and renders them through a trained *target* HRAvatar:
+```shell
+bash demos/demo_2_cross_reenactment.sh \
+     /data/subjects/alice \
+     outputs/custom/bob
+```
+The default offline feature extractor is **DECA** (as used by the
+upstream HRAvatar preprocessing pipeline, and as documented in
+[MTamon/DECA@release/cuda128](https://github.com/MTamon/DECA/tree/release/cuda128)).
+SMIRK is wired as an *online* expression encoder inside HRAvatar via
+`--with_param_net_smirk`; see [`demos/demo_2_cross_reenactment.sh`](demos/demo_2_cross_reenactment.sh)
+for how to plug in a SMIRK-produced trajectory.
+
+### 3. Visualize HRAvatar's actual renderer input
+Reads `tracked_params.json` produced by the preprocessing pipeline
+(i.e. the **post-optimize** features — after DECA's raw output is
+refined by `optimize.py` against 2D landmarks, iris and a photometric
+objective), poses the FLAME mesh with exactly the same LBS chain HRAvatar
+uses at inference, projects with exactly the same camera the data loader
+builds, and overlays the result on the original frames.  No HRAvatar
+checkpoint is loaded — this is a feature inspector for downstream
+Listening-Head-Generation models that want to produce these tensors.
+```shell
+bash demos/_preprocess_subject.sh /data/subjects alice /data/raw/alice.mp4 hdtf
+python demos/demo_3_overlay_tracking.py \
+       --subject_dir /data/subjects/alice \
+       --output      /tmp/alice_features.mp4 \
+       --mode        all
+```
+Modes: `vertices`, `wireframe`, `landmarks`, `params_card`, `all`.
+Overlay style follows
+[`MTamon/smirk@release/cuda128/demos/demo_video.py --show_vertices`](https://github.com/MTamon/smirk/blob/release/cuda128/demos/demo_video.py).
 
 
 ## 🎨 Rendering
