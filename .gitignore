@@ -4,3 +4,6 @@ outputs/
 
 preprocess/submodules/RobustVideoMatting/rvm_resnet50.pth
 assets/smirk/pretrained_models/SMIRK_em1.pt
+assets/flame_model/flame2020.pkl
+assets/FLAME2020/*
+assets/intrinsic_anything/albedo/*

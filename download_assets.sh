@@ -102,7 +102,7 @@ mkdir -p \
   assets/FLAME2020 \
   assets/smirk \
   assets/smirk/pretrained_models \
-  assets/intrinsic_anything/albedo \
+  assets/intrinsic_anything \
   preprocess/submodules/DECA/data \
   preprocess/submodules/face-parsing.PyTorch/res/cp \
   preprocess/submodules/RobustVideoMatting
@@ -134,7 +134,7 @@ if [[ ${WITH_FLAME} -eq 1 ]]; then
       wget --post-data "username=${FLAME_USER_ENC}&password=${FLAME_PASS_ENC}" \
            'https://download.is.tue.mpg.de/download.php?domain=flame&sfile=FLAME2020.zip&resume=1' \
            -O FLAME2020.zip --no-check-certificate --continue
-      unzip -o FLAME2020.zip -d assets/FLAME2020/
+      unzip -o FLAME2020.zip -d assets/
       rm -f FLAME2020.zip
     fi
 
@@ -236,36 +236,30 @@ if [[ ${WITH_OPTIONAL} -eq 1 ]]; then
   if [[ -f "${IA_CKPT}" ]]; then
     say "IntrinsicAnything albedo weights already present, skipping."
   else
-    if python -c 'import huggingface_hub' >/dev/null 2>&1; then
-      say "Downloading IntrinsicAnything albedo weights from HuggingFace ..."
-      python - <<'PY'
-from huggingface_hub import snapshot_download
-from pathlib import Path
-import shutil
-
-tmp = Path("assets/intrinsic_anything/_tmp")
-snapshot_download(
-    repo_id="LittleFrog/IntrinsicAnything",
-    repo_type="space",
-    allow_patterns=["weights/albedo/*"],
-    local_dir=str(tmp),
-)
-src = tmp / "weights" / "albedo"
-dst = Path("assets/intrinsic_anything/albedo")
-dst.mkdir(parents=True, exist_ok=True)
-for item in src.rglob("*"):
-    rel = item.relative_to(src)
-    target = dst / rel
-    if item.is_dir():
-        target.mkdir(parents=True, exist_ok=True)
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item, target)
-shutil.rmtree(tmp, ignore_errors=True)
-print(f"IntrinsicAnything weights installed at {dst}")
-PY
+    # hf / huggingface-cli のどちらかを選択、なければインストール
+    HF_CMD=""
+    if command -v hf >/dev/null 2>&1; then
+      HF_CMD="hf"
+    elif command -v huggingface-cli >/dev/null 2>&1; then
+      HF_CMD="huggingface-cli"
     else
-      warn "huggingface_hub not installed; skipping IntrinsicAnything (needed only for --with_intrinsic_supervise)."
+      warn "'hf' / 'huggingface-cli' not found. Installing huggingface_hub ..."
+      pip install -q "huggingface_hub[hf_xet]>=1.0"
+      export PATH="$HOME/.local/bin:$PATH"
+      if command -v hf >/dev/null 2>&1; then
+        HF_CMD="hf"
+      elif command -v huggingface-cli >/dev/null 2>&1; then
+        HF_CMD="huggingface-cli"
+      fi
+    fi
+
+    if [[ -n "${HF_CMD}" ]]; then
+      say "Downloading IntrinsicAnything albedo weights via '${HF_CMD}' ..."
+      "${HF_CMD}" download LittleFrog/IntrinsicAnything \
+        --include "albedo/**" \
+        --local-dir assets/intrinsic_anything
+    else
+      warn "Neither 'hf' nor 'huggingface-cli' is available. Skipping IntrinsicAnything."
     fi
   fi
 else
