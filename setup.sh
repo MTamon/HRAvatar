@@ -150,6 +150,7 @@ python -m pip install --no-deps PyYAML==6.0.3
 python -m pip install --no-deps scikit-image==0.25.2
 python -m pip install --no-deps scikit-learn==1.7.2
 python -m pip install --no-deps scipy==1.16.3
+python -m pip install --no-deps slicerator==1.1.0
 python -m pip install --no-deps tifffile==2025.10.16
 python -m pip install --no-deps torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 python -m pip install --no-deps torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
