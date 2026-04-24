@@ -130,7 +130,7 @@ python -m pip install --no-deps kornia==0.8.2
 python -m pip install --no-deps kornia_rs==0.1.10
 python -m pip install --no-deps llvmlite==0.45.1
 python -m pip install --no-deps loguru==0.7.3
-python -m pip install --no-deps mediapipe==0.10.33
+python -m pip install --no-deps mediapipe==0.10.30
 python -m pip install --no-deps ninja==1.13.0
 python -m pip install --no-deps numba==0.62.1
 python -m pip install --no-deps numpy==2.2.6
@@ -163,18 +163,17 @@ python -m pip install --no-deps triton==3.5.1
 python -m pip install --no-deps typing_extensions==4.15.0
 python -m pip install --no-deps yacs==0.1.8
 
-# JAX / MediaPipe stack.
-# mediapipe 0.10.33 dropped its hard numpy<2 / protobuf<5 caps and now
-# requires absl-py~=2.3 and flatbuffers~=25.9 instead.
-# protobuf is bumped to 5.x because tensorflow 2.20 requires it (see below).
-python -m pip install --no-deps jax==0.4.30
-python -m pip install --no-deps jaxlib==0.4.30
-# ml_dtypes is set once below in the tensorflow block (>=0.5.1 required).
-python -m pip install --no-deps opt_einsum==3.4.0
+# MediaPipe runtime stack.
+# mediapipe 0.10.30 is the earliest release that drops the hard numpy<2
+# cap, while still pulling its own bundled tflite runtime — so we no
+# longer need full tensorflow / jax / jaxlib in the env.  It does require
+# absl-py~=2.3 and flatbuffers~=25.9.
+# protobuf is kept at the MTamon-aligned 4.25.5 (mediapipe 0.10.30 has no
+# protobuf cap; tensorboard 2.20 only needs >=4.21).
 python -m pip install --no-deps absl-py==2.3.1
 python -m pip install --no-deps attrs==24.2.0
 python -m pip install --no-deps flatbuffers==25.9.23
-python -m pip install --no-deps protobuf==5.28.3
+python -m pip install --no-deps protobuf==4.25.5
 
 # Lightning / HF stack.
 python -m pip install --no-deps timm==0.9.16
@@ -193,37 +192,26 @@ python -m pip install --no-deps einops==0.8.1
 python -m pip install --no-deps natsort==8.4.0
 python -m pip install --no-deps future==1.0.0
 python -m pip install --no-deps ipdb==0.13.13
-# tensorboard pinned to match tensorflow 2.20.0 (~=2.20.0 required).
+# tensorboard is required by train.py via torch.utils.tensorboard.
+# 2.20.0 is chosen because it is the first release that explicitly supports
+# numpy 2.x; older 2.17.x is fine for runtime but emits a numpy ABI warning.
 python -m pip install --no-deps tensorboard==2.20.0
 python -m pip install --no-deps av==12.3.0
 python -m pip install --no-deps pims==0.7
 python -m pip install --no-deps packaging==25.0
 
-# tensorflow 2.20 stack.
-# Bumped from 2.19 because 2.19 caps numpy<2.2, which conflicts with the
-# numpy==2.2.6 pin needed by chumpy + the rest of the stack.  2.20 only
-# requires numpy>=1.26 (no upper bound) and keras>=3.10, ml_dtypes>=0.5.1,
-# protobuf>=5.28, tensorboard~=2.20.0 — all satisfied above.
-python -m pip install --no-deps astunparse==1.6.3
-python -m pip install --no-deps gast==0.7.0
-python -m pip install --no-deps google-pasta==0.2.0
+# tensorboard support deps.
+# tensorboard itself is pinned in the "Config / utilities" block above
+# because train.py uses `from torch.utils.tensorboard import SummaryWriter`,
+# which loads the tensorboard wheel at runtime.  These are tensorboard's
+# own runtime requirements (grpcio / markdown / data-server / werkzeug).
+# Full tensorflow + keras + jax/jaxlib are intentionally NOT installed:
+# nothing in HRAvatar's execution path imports them (the only TF callers
+# are unused FVD/ADM eval scripts under preprocess/submodules/IntrinsicAnything).
 python -m pip install --no-deps grpcio==1.80.0
-python -m pip install --no-deps h5py==3.16.0
-python -m pip install --no-deps keras==3.14.0
-python -m pip install --no-deps libclang==18.1.1
 python -m pip install --no-deps markdown==3.10.2
-python -m pip install --no-deps markdown-it-py==4.0.0
-python -m pip install --no-deps mdurl==0.1.2
-python -m pip install --no-deps ml_dtypes==0.5.4
-python -m pip install --no-deps namex==0.1.0
-python -m pip install --no-deps optree==0.19.0
-python -m pip install --no-deps pygments==2.20.0
-python -m pip install --no-deps rich==15.0.0
 python -m pip install --no-deps tensorboard-data-server==0.7.2
-python -m pip install --no-deps tensorflow==2.20.0
-python -m pip install --no-deps tensorflow-io-gcs-filesystem==0.37.1
 python -m pip install --no-deps werkzeug==3.1.8
-python -m pip install --no-deps wrapt==2.1.2
 
 # Use in smirk for the `--no-deps`
 python -m pip install --no-deps accelerate==1.11.0

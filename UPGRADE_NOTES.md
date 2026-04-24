@@ -23,19 +23,19 @@ same migration for the DECA / SMIRK / FLARE stacks:
 | scipy               | (unpinned)                               | 1.16.3                                    |
 | kornia              | 0.7.3                                    | 0.8.2                                     |
 | opencv-python       | 4.8.0.76                                 | 4.12.0.88                                 |
-| mediapipe           | 0.10.10                                  | 0.10.33                                   |
+| mediapipe           | 0.10.10                                  | 0.10.30                                   |
 | pillow              | (transitive)                             | 12.0.0                                    |
 | pytorch-lightning   | 1.5.2                                    | 2.5.2                                     |
 | torchmetrics        | 1.4.0.post0                              | 1.6.0                                     |
 | pytorch3d           | 0.7.2 (conda)                            | 0.7.8 (built from source)                 |
-| jax / jaxlib        | 0.4.30                                   | 0.4.30                                    |
+| jax / jaxlib        | 0.4.30                                   | (removed — unused; mediapipe 0.10.30 dropped its jax dep) |
 | chumpy              | 0.70 (PyPI)                              | git mattloper/chumpy (numpy-2 compatible) |
 | scikit-image        | 0.22.0                                   | 0.25.2                                    |
 | transformers        | 4.44.0                                   | 4.57.1                                    |
 | huggingface-hub     | 0.24.5                                   | 0.34.4                                    |
-| tensorflow          | (none)                                   | 2.20.0                                    |
-| tensorboard         | (none)                                   | 2.20.0                                    |
-| protobuf            | (transitive)                             | 5.28.3                                    |
+| tensorflow / keras  | (none)                                   | (removed — never imported on the active path) |
+| tensorboard         | (none)                                   | 2.20.0 (used by `torch.utils.tensorboard.SummaryWriter`) |
+| protobuf            | (transitive)                             | 4.25.5                                    |
 | flatbuffers         | (transitive)                             | 25.9.23                                   |
 | nvdiffrast          | pip                                      | git (NVlabs main)                         |
 | iris detector       | `face-detection-tflite` (fdlite)         | MediaPipe FaceLandmarker (in-repo)        |
