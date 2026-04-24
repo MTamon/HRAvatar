@@ -23,17 +23,22 @@ same migration for the DECA / SMIRK / FLARE stacks:
 | scipy               | (unpinned)                               | 1.16.3                                    |
 | kornia              | 0.7.3                                    | 0.8.2                                     |
 | opencv-python       | 4.8.0.76                                 | 4.12.0.88                                 |
-| mediapipe           | 0.10.10                                  | 0.10.14                                   |
+| mediapipe           | 0.10.10                                  | 0.10.33                                   |
 | pillow              | (transitive)                             | 12.0.0                                    |
 | pytorch-lightning   | 1.5.2                                    | 2.5.2                                     |
 | torchmetrics        | 1.4.0.post0                              | 1.6.0                                     |
 | pytorch3d           | 0.7.2 (conda)                            | 0.7.8 (built from source)                 |
-| jax / jaxlib        | 0.4.30                                   | 0.4.30 (kept — mediapipe dep)             |
+| jax / jaxlib        | 0.4.30                                   | 0.4.30                                    |
 | chumpy              | 0.70 (PyPI)                              | git mattloper/chumpy (numpy-2 compatible) |
 | scikit-image        | 0.22.0                                   | 0.25.2                                    |
-| transformers        | 4.44.0                                   | 4.44.2                                    |
-| huggingface-hub     | 0.24.5                                   | 0.25.2                                    |
+| transformers        | 4.44.0                                   | 4.57.1                                    |
+| huggingface-hub     | 0.24.5                                   | 0.34.4                                    |
+| tensorflow          | (none)                                   | 2.20.0                                    |
+| tensorboard         | (none)                                   | 2.20.0                                    |
+| protobuf            | (transitive)                             | 5.28.3                                    |
+| flatbuffers         | (transitive)                             | 25.9.23                                   |
 | nvdiffrast          | pip                                      | git (NVlabs main)                         |
+| iris detector       | `face-detection-tflite` (fdlite)         | MediaPipe FaceLandmarker (in-repo)        |
 
 ## Deviations from the MTamon reference branches (reported per request)
 
@@ -78,15 +83,26 @@ are mutually exclusive.
   pre-2.x PyTorch and although the HRAvatar-consumed state dict is
   tensors-only, we do not want to risk the default `weights_only=True`
   failing on a legacy asset we cannot regenerate.
+* `preprocess/iris.py` — rewritten on top of the MediaPipe Tasks
+  `FaceLandmarker` model (`assets/smirk/face_landmarker.task`).  The
+  previous implementation used `face-detection-tflite` (fdlite), whose
+  `iris_landmark.py` calls `np.math.sqrt`, a name removed in numpy 2.x;
+  upstream has not released a fix.  The replacement reads landmark
+  indices 468 (right iris centre) and 473 (left iris centre) and writes
+  the same `iris.json` format consumed by
+  `preprocess/submodules/DECA/optimize.py`, so the rest of the pipeline
+  is unchanged.
 
 These are intentionally the minimum set of patches; no functional changes.
 
 ## Files added or rewritten by this branch
 
 * `environment.yml`  — rewritten (conda only owns python + cuda toolkit).
-* `requirements.txt` — NEW.  Authoritative pin set, applied with `--no-deps`.
 * `setup.sh`         — NEW.  Ordered installer mirroring
-  `MTamon/DECA:install_128.sh`.
+  `MTamon/DECA:install_128.sh`.  This is the **single source of truth**
+  for pip pins (a separate `requirements.txt` is intentionally not kept,
+  since `--no-deps` ordering matters and a flat requirements file
+  cannot express it).
 * `download_assets.sh` — NEW.  Fetches FLAME / DECA / SMIRK / RVM /
   face-parsing / IntrinsicAnything weights.
 * `demos/README.md`                        — NEW.

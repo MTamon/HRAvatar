@@ -115,7 +115,11 @@ python -m pip install git+https://github.com/mattloper/chumpy.git
 # Pinned deps. Installed with --no-deps to avoid pip rewriting the pin set.
 python -m pip install --no-deps Cython==0.29.35
 python -m pip install --no-deps face-alignment==1.4.1
-python -m pip install --no-deps face-detection-tflite==0.6.0
+# face-detection-tflite (fdlite) was removed: it imports `np.math.sqrt`,
+# which numpy 2.x dropped, and upstream has not released a fix. The iris
+# landmarks it provided are now extracted directly via the MediaPipe
+# FaceLandmarker model in preprocess/iris.py (same model already used by
+# scene/data_loader.py and utils/general_utils.py).
 python -m pip install --no-deps filelock==3.20.0
 python -m pip install --no-deps fsspec==2025.10.0
 python -m pip install --no-deps fvcore==0.1.5.post20221221
@@ -126,7 +130,7 @@ python -m pip install --no-deps kornia==0.8.2
 python -m pip install --no-deps kornia_rs==0.1.10
 python -m pip install --no-deps llvmlite==0.45.1
 python -m pip install --no-deps loguru==0.7.3
-python -m pip install --no-deps mediapipe==0.10.14
+python -m pip install --no-deps mediapipe==0.10.33
 python -m pip install --no-deps ninja==1.13.0
 python -m pip install --no-deps numba==0.62.1
 python -m pip install --no-deps numpy==2.2.6
@@ -159,15 +163,18 @@ python -m pip install --no-deps triton==3.5.1
 python -m pip install --no-deps typing_extensions==4.15.0
 python -m pip install --no-deps yacs==0.1.8
 
-# JAX / MediaPipe stack (pinned to SMIRK-approved versions).
+# JAX / MediaPipe stack.
+# mediapipe 0.10.33 dropped its hard numpy<2 / protobuf<5 caps and now
+# requires absl-py~=2.3 and flatbuffers~=25.9 instead.
+# protobuf is bumped to 5.x because tensorflow 2.20 requires it (see below).
 python -m pip install --no-deps jax==0.4.30
 python -m pip install --no-deps jaxlib==0.4.30
-python -m pip install --no-deps ml_dtypes==0.4.1
+# ml_dtypes is set once below in the tensorflow block (>=0.5.1 required).
 python -m pip install --no-deps opt_einsum==3.4.0
-python -m pip install --no-deps absl-py==2.1.0
+python -m pip install --no-deps absl-py==2.3.1
 python -m pip install --no-deps attrs==24.2.0
-python -m pip install --no-deps flatbuffers==24.3.25
-python -m pip install --no-deps protobuf==4.25.5
+python -m pip install --no-deps flatbuffers==25.9.23
+python -m pip install --no-deps protobuf==5.28.3
 
 # Lightning / HF stack.
 python -m pip install --no-deps timm==0.9.16
@@ -175,7 +182,7 @@ python -m pip install --no-deps pytorch_lightning==2.5.2
 python -m pip install --no-deps torchmetrics==1.6.0
 python -m pip install --no-deps lightning-utilities==0.11.9
 python -m pip install --no-deps transformers==4.57.1
-python -m pip install --no-deps huggingface_hub==0.27.1
+python -m pip install --no-deps huggingface_hub==0.34.4
 python -m pip install --no-deps safetensors==0.4.5
 python -m pip install --no-deps diffusers==0.30.3
 
@@ -186,12 +193,17 @@ python -m pip install --no-deps einops==0.8.1
 python -m pip install --no-deps natsort==8.4.0
 python -m pip install --no-deps future==1.0.0
 python -m pip install --no-deps ipdb==0.13.13
-python -m pip install --no-deps tensorboard==2.17.1
+# tensorboard pinned to match tensorflow 2.20.0 (~=2.20.0 required).
+python -m pip install --no-deps tensorboard==2.20.0
 python -m pip install --no-deps av==12.3.0
 python -m pip install --no-deps pims==0.7
 python -m pip install --no-deps packaging==25.0
 
-# Use in tensorflow
+# tensorflow 2.20 stack.
+# Bumped from 2.19 because 2.19 caps numpy<2.2, which conflicts with the
+# numpy==2.2.6 pin needed by chumpy + the rest of the stack.  2.20 only
+# requires numpy>=1.26 (no upper bound) and keras>=3.10, ml_dtypes>=0.5.1,
+# protobuf>=5.28, tensorboard~=2.20.0 — all satisfied above.
 python -m pip install --no-deps astunparse==1.6.3
 python -m pip install --no-deps gast==0.7.0
 python -m pip install --no-deps google-pasta==0.2.0
@@ -208,7 +220,7 @@ python -m pip install --no-deps optree==0.19.0
 python -m pip install --no-deps pygments==2.20.0
 python -m pip install --no-deps rich==15.0.0
 python -m pip install --no-deps tensorboard-data-server==0.7.2
-python -m pip install --no-deps tensorflow==2.19.0
+python -m pip install --no-deps tensorflow==2.20.0
 python -m pip install --no-deps tensorflow-io-gcs-filesystem==0.37.1
 python -m pip install --no-deps werkzeug==3.1.8
 python -m pip install --no-deps wrapt==2.1.2
@@ -218,7 +230,8 @@ python -m pip install --no-deps accelerate==1.11.0
 python -m pip install --no-deps aiohappyeyeballs==2.6.1
 python -m pip install --no-deps aiohttp==3.13.2
 python -m pip install --no-deps aiosignal==1.4.0
-python -m pip install --no-deps albucore==0.0.19
+# albumentations 1.4.18 requires albucore==0.0.17 exactly.
+python -m pip install --no-deps albucore==0.0.17
 python -m pip install --no-deps albumentations==1.4.18
 python -m pip install --no-deps annotated-types==0.7.0
 python -m pip install --no-deps anyio==4.11.0
@@ -242,6 +255,9 @@ python -m pip install --no-deps eval_type_backport==0.2.2
 python -m pip install --no-deps evaluate==0.4.6
 python -m pip install --no-deps flash_attn==2.8.3
 python -m pip install --no-deps fonttools==4.60.1
+# ftfy is consumed by openai/CLIP's tokenizer when the BPE encoder hits
+# malformed unicode; it is otherwise a soft dependency.
+python -m pip install --no-deps ftfy==6.3.1
 python -m pip install --no-deps frozenlist==1.8.0
 python -m pip install --no-deps gdown==5.2.0
 python -m pip install --no-deps gitdb==4.0.12
@@ -405,8 +421,18 @@ print("torch", torch.__version__, "tv", torchvision.__version__, "cuda", torch.v
 print("cuda available:", torch.cuda.is_available())
 import pytorch3d, nvdiffrast, diff_gaussian_rasterization_c10, simple_knn
 import chumpy, kornia, mediapipe, face_alignment
+# Smoke-test the MediaPipe FaceLandmarker entry point that replaced fdlite
+# in preprocess/iris.py.
+from mediapipe.tasks.python import vision as _mp_vision  # noqa: F401
 print("OK")
 PY
+
+# Optional: print pip's view of the dependency graph. With --no-deps installs
+# we expect a small number of "X requires Y, which is not installed" lines for
+# pure-optional extras (e.g. carvekit web server, pyshtools astropy/xarray);
+# any real version conflict should be surfaced and addressed here.
+echo "[6/6] pip check (informational)"
+python -m pip check || true
 
 
 if [[ ${NO_ASSETS} -eq 0 ]]; then

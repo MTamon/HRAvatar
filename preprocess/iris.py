@@ -1,86 +1,100 @@
-# Code borrowed and adapted from Neural Head Avatar
-# https://github.com/philgras/neural-head-avatars/blob/473457eef83c9ee26f316451e31c2aa01a74603c/python_scripts/video_to_dataset.py#L26
-from fdlite import (
-    FaceDetection,
-    FaceLandmark,
-    face_detection_to_roi,
-    IrisLandmark,
-    iris_roi_from_face_landmarks,
-)
-import sys,os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from PIL import Image
-import numpy as np
-import os
+# Iris landmark extraction using MediaPipe FaceLandmarker (Tasks API).
+#
+# This file used to depend on `face-detection-tflite` (fdlite), which calls
+# `np.math.sqrt` at import time and is therefore broken under numpy 2.x.
+# We replaced fdlite with the same MediaPipe FaceLandmarker model that
+# scene/data_loader.py and utils/general_utils.py already use, so the iris
+# centres are consistent across the rest of the pipeline.
+#
+# Output format (unchanged, consumed by preprocess/submodules/DECA/optimize.py):
+#   {frame_basename: [x_first, y_first, x_second, y_second]}  in pixel units
+# where (first, second) follows the original fdlite ordering after `[::-1]`,
+# i.e. right-iris first, left-iris second in face-relative coordinates.
 import argparse
+import json
+import os
 import re
+import sys
+
+import mediapipe as mp
+import numpy as np
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from PIL import Image
 from tqdm import tqdm
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# MediaPipe FaceLandmarker outputs 478 landmarks; 468..472 are the right-face
+# iris ring (centre = 468), 473..477 are the left-face iris ring (centre = 473).
+RIGHT_IRIS_CENTER = 468
+LEFT_IRIS_CENTER = 473
+
+# Match the path scene/data_loader.py loads.
+DEFAULT_TASK_PATH = os.path.join(
+    os.path.dirname(__file__), '..', 'assets', 'smirk', 'face_landmarker.task'
+)
+
+
 def natural_sort_key(s):
     sub_strings = re.split(r'(\d+)', s)
     sub_strings = [int(c) if c.isdigit() else c for c in sub_strings]
     return sub_strings
-def annotate_iris_landmarks(image_path, savefolder):
-    """
-    Annotates each frame with 2 iris landmarks
-    :return: dict mapping frame number to landmarks numpy array
-    """
 
-    # iris detector
-    detect_faces = FaceDetection()
-    detect_face_landmarks = FaceLandmark()
-    detect_iris_landmarks = IrisLandmark()
+
+def _build_detector(task_path):
+    base_options = python.BaseOptions(model_asset_path=task_path)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1,
+    )
+    return vision.FaceLandmarker.create_from_options(options)
+
+
+def annotate_iris_landmarks(image_path, savefolder, task_path=DEFAULT_TASK_PATH):
+    """Annotate each frame with 2 iris landmarks (right then left)."""
+    if not os.path.exists(task_path):
+        raise FileNotFoundError(
+            f"face_landmarker.task not found at {task_path}. "
+            "Run download_assets.sh first."
+        )
+
     frames = os.listdir(image_path)
-    # frames.sort(key=lambda f: int(re.sub('\D', '', f)))
     frames.sort(key=natural_sort_key)
-    # frames = self._get_frame_list()
     landmarks = {}
 
-    for frame in tqdm(frames):
-        img = Image.open(os.path.join(image_path, frame))
-        
-        width, height = img.size
-        img_size = (width, height)
+    with _build_detector(task_path) as detector:
+        for frame in tqdm(frames):
+            img = Image.open(os.path.join(image_path, frame)).convert('RGB')
+            width, height = img.size
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=np.asarray(img, dtype=np.uint8),
+            )
 
-        face_detections = detect_faces(img)
-        landmarks[frame] = None
-        if len(face_detections) != 1:
-            print("Empty iris landmarks")
-        else:
-            for face_detection in face_detections:
-                try:
-                    face_roi = face_detection_to_roi(face_detection, img_size)
-                except ValueError:
+            result = detector.detect(mp_image)
+
+            lmks = []
+            if not result.face_landmarks:
+                print("Empty iris landmarks")
+            else:
+                face_lm = result.face_landmarks[0]
+                if len(face_lm) <= LEFT_IRIS_CENTER:
                     print("Empty iris landmarks")
-                    break
+                else:
+                    right = face_lm[RIGHT_IRIS_CENTER]
+                    left = face_lm[LEFT_IRIS_CENTER]
+                    lmks = [
+                        right.x * width, right.y * height,
+                        left.x * width, left.y * height,
+                    ]
 
-                face_landmarks = detect_face_landmarks(img, face_roi)
-                if len(face_landmarks) == 0:
-                    print("Empty iris landmarks")
-                    break
+            landmarks[frame] = lmks
 
-                iris_rois = iris_roi_from_face_landmarks(face_landmarks, img_size)
-
-                if len(iris_rois) != 2:
-                    print("Empty iris landmarks")
-                    break
-
-                lmks = []
-                for iris_roi in iris_rois[::-1]:
-                    try:
-                        iris_landmarks = detect_iris_landmarks(img, iris_roi).iris[
-                                         0:1
-                                         ]
-                    except np.linalg.LinAlgError:
-                        print("Failed to get iris landmarks")
-                        break
-
-                    for landmark in iris_landmarks:
-                        lmks.append(landmark.x * width)
-                        lmks.append(landmark.y * height)
-
-        landmarks[frame] = lmks # if empty iris landmarks, then just use previous frame...but if the first frame is empty, then we have a problem.
-    import json
-    json.dump(landmarks, open(os.path.join(savefolder, 'iris.json'), 'w'))
+    with open(os.path.join(savefolder, 'iris.json'), 'w') as f:
+        json.dump(landmarks, f)
 
 
 if __name__ == '__main__':
