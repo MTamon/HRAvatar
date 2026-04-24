@@ -1,3 +1,6 @@
 *.pyc
 .vscode/
 outputs/
+
+preprocess/submodules/RobustVideoMatting/rvm_resnet50.pth
+assets/smirk/pretrained_models/SMIRK_em1.pt
