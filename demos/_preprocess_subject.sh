@@ -35,8 +35,8 @@ cd "${REPO_ROOT}"
 DATA_DIR="${ROOT}/${NAME}"
 DECA_DIR="${REPO_ROOT}/preprocess/submodules/DECA"
 mkdir -p "${DATA_DIR}"
-if [[ ! -f "${DATA_DIR}/video.mp4" ]]; then
-  ln -sf "$(realpath "${VIDEO}")" "${DATA_DIR}/video.mp4"
+if [[ ! -f "${DATA_DIR}/${NAME}.mp4" ]]; then
+  ln -sf "$(realpath "${VIDEO}")" "${DATA_DIR}/${NAME}.mp4"
 fi
 
 echo "[preprocess 1/5] crop + matting"
