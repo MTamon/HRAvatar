@@ -191,7 +191,29 @@ python -m pip install --no-deps av==12.3.0
 python -m pip install --no-deps pims==0.7
 python -m pip install --no-deps packaging==25.0
 
-# Use in smirk for the `--no-deps` test
+# Use in tensorflow
+python -m pip install --no-deps astunparse==1.6.3
+python -m pip install --no-deps gast==0.7.0
+python -m pip install --no-deps google-pasta==0.2.0
+python -m pip install --no-deps grpcio==1.80.0
+python -m pip install --no-deps h5py==3.16.0
+python -m pip install --no-deps keras==3.14.0
+python -m pip install --no-deps libclang==18.1.1
+python -m pip install --no-deps markdown==3.10.2
+python -m pip install --no-deps markdown-it-py==4.0.0
+python -m pip install --no-deps mdurl==0.1.2
+python -m pip install --no-deps ml_dtypes==0.5.4
+python -m pip install --no-deps namex==0.1.0
+python -m pip install --no-deps optree==0.19.0
+python -m pip install --no-deps pygments==2.20.0
+python -m pip install --no-deps rich==15.0.0
+python -m pip install --no-deps tensorboard-data-server==0.7.2
+python -m pip install --no-deps tensorflow==2.19.0
+python -m pip install --no-deps tensorflow-io-gcs-filesystem==0.37.1
+python -m pip install --no-deps werkzeug==3.1.8
+python -m pip install --no-deps wrapt==2.1.2
+
+# Use in smirk for the `--no-deps`
 python -m pip install --no-deps accelerate==1.11.0
 python -m pip install --no-deps aiohappyeyeballs==2.6.1
 python -m pip install --no-deps aiohttp==3.13.2
