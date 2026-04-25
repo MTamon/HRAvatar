@@ -324,6 +324,12 @@ python -m pip install --no-deps zipp==3.23.0
 
 # HRAvatar-only additions (NOT in the MTamon references).
 # pyshtools — SH rotation helper in utils/sh_utils.py (filter_envmap path).
+# pyshtools' package __init__ runs `from . import constants`, which requires
+# astropy (and pyerfa transitively). utils/sh_utils.py lazy-imports pyshtools
+# inside rotateSH so train.py does not need these at startup, but install them
+# here so the rotateSH path also works out of the box.
+python -m pip install --no-deps astropy==7.0.1
+python -m pip install --no-deps pyerfa==2.0.1.5
 python -m pip install --no-deps pyshtools==4.13.1
 # plyfile — used by scene/gaussian_model.py save/load.
 python -m pip install --no-deps plyfile==1.1.2
@@ -430,7 +436,8 @@ PY
 
 # Optional: print pip's view of the dependency graph. With --no-deps installs
 # we expect a small number of "X requires Y, which is not installed" lines for
-# pure-optional extras (e.g. carvekit web server, pyshtools astropy/xarray);
+# pure-optional extras (e.g. carvekit web server, or pyshtools' xarray which
+# is only needed by its shio/shclasses paths that HRAvatar does not exercise);
 # any real version conflict should be surfaced and addressed here.
 echo "[6/6] pip check (informational)"
 python -m pip check || true
