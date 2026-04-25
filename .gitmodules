@@ -1,3 +1,7 @@
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
 	url = https://github.com/camenduru/simple-knn.git
+[submodule "preprocess/submodules/DECA"]
+	path = preprocess/submodules/DECA
+	url = git@github.com:MTamon/DECA.git
+	branch = cuda128-HRAvatare
