@@ -266,6 +266,65 @@ else
   say "--no_optional given; skipping IntrinsicAnything."
 fi
 
+# ----------------------------------------------------------------------------
+# H. SMIRK eyelid / landmark .npy/.npz files (HuggingFace Xet — pinned revision)
+#    destination: preprocess/submodules/DECA/data/
+#    source:      Skywork/SkyReels-A1  extra_models/smirk/
+#      l_eyelid.npy                 121 kB
+#      r_eyelid.npy                 121 kB
+#      mediapipe_landmark_embedding.npz  4.52 kB
+# ----------------------------------------------------------------------------
+SMIRK_DECA_DIR="preprocess/submodules/DECA/data"
+SMIRK_L_EYELID="${SMIRK_DECA_DIR}/l_eyelid.npy"
+SMIRK_R_EYELID="${SMIRK_DECA_DIR}/r_eyelid.npy"
+SMIRK_MP_NPZ="${SMIRK_DECA_DIR}/mediapipe_landmark_embedding.npz"
+SMIRK_NPY_REVISION="e8f62f871898c2323750f26614086e52b6e1ea15"
+
+if [[ -f "${SMIRK_L_EYELID}" && -f "${SMIRK_R_EYELID}" && -f "${SMIRK_MP_NPZ}" ]]; then
+  say "SMIRK .npy/.npz files already present, skipping."
+else
+  HF_CMD_NPY=""
+  if command -v hf >/dev/null 2>&1; then
+    HF_CMD_NPY="hf"
+  elif command -v huggingface-cli >/dev/null 2>&1; then
+    HF_CMD_NPY="huggingface-cli"
+  else
+    warn "'hf' / 'huggingface-cli' not found. Installing huggingface_hub[hf_xet] ..."
+    pip install -q "huggingface_hub[hf_xet]>=1.0"
+    export PATH="$HOME/.local/bin:$PATH"
+    if command -v hf >/dev/null 2>&1; then
+      HF_CMD_NPY="hf"
+    elif command -v huggingface-cli >/dev/null 2>&1; then
+      HF_CMD_NPY="huggingface-cli"
+    fi
+  fi
+
+  if [[ -n "${HF_CMD_NPY}" ]]; then
+    say "Downloading SMIRK .npy/.npz files via '${HF_CMD_NPY}' (revision ${SMIRK_NPY_REVISION}) ..."
+    _TMP_NPY="$(mktemp -d)"
+    "${HF_CMD_NPY}" download Skywork/SkyReels-A1 \
+      extra_models/smirk/l_eyelid.npy \
+      extra_models/smirk/r_eyelid.npy \
+      extra_models/smirk/mediapipe_landmark_embedding.npz \
+      --revision "${SMIRK_NPY_REVISION}" \
+      --local-dir "${_TMP_NPY}"
+    mv -f "${_TMP_NPY}/extra_models/smirk/l_eyelid.npy"                  "${SMIRK_L_EYELID}"
+    mv -f "${_TMP_NPY}/extra_models/smirk/r_eyelid.npy"                  "${SMIRK_R_EYELID}"
+    mv -f "${_TMP_NPY}/extra_models/smirk/mediapipe_landmark_embedding.npz" "${SMIRK_MP_NPZ}"
+    rm -rf "${_TMP_NPY}"
+    say "SMIRK .npy/.npz files installed."
+  else
+    warn "huggingface-cli unavailable; falling back to wget resolve URL ..."
+    _HF_BASE="https://huggingface.co/Skywork/SkyReels-A1/resolve/${SMIRK_NPY_REVISION}/extra_models/smirk"
+    [[ ! -f "${SMIRK_L_EYELID}" ]] && wget -q --show-progress --continue \
+      -O "${SMIRK_L_EYELID}" "${_HF_BASE}/l_eyelid.npy"
+    [[ ! -f "${SMIRK_R_EYELID}" ]] && wget -q --show-progress --continue \
+      -O "${SMIRK_R_EYELID}" "${_HF_BASE}/r_eyelid.npy"
+    [[ ! -f "${SMIRK_MP_NPZ}" ]] && wget -q --show-progress --continue \
+      -O "${SMIRK_MP_NPZ}" "${_HF_BASE}/mediapipe_landmark_embedding.npz"
+  fi
+fi
+
 say "Done. Asset summary:"
 for f in \
   "${FLAME_PKL_REPO}" \
@@ -275,7 +334,10 @@ for f in \
   "${FP_PTH}" \
   "${RVM_PTH}" \
   "${MP_TASK}" \
-  "${IA_CKPT}"; do
+  "${IA_CKPT}" \
+  "${SMIRK_L_EYELID}" \
+  "${SMIRK_R_EYELID}" \
+  "${SMIRK_MP_NPZ}"; do
   if [[ -f "${f}" ]]; then
     printf '  %-70s %s\n' "${f}" "$(du -h "${f}" | cut -f1)"
   else
