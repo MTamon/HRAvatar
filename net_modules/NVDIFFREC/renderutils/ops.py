@@ -48,6 +48,16 @@ def _get_plugin():
     # Linker options.
     if os.name == 'posix':
         ldflags = ['-lcuda', '-lnvrtc']
+        # CUDA 12.x toolkits ship libcuda.so as a link-time stub under
+        # `<CUDA_HOME>/lib64/stubs/` rather than directly in lib64, so
+        # `-lcuda` fails with "cannot find -lcuda" unless we add the
+        # stubs directory to the linker search path. The actual driver
+        # is loaded from /usr/lib at runtime via libcuda.so.1.
+        cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+        if cuda_home:
+            stubs_dir = os.path.join(cuda_home, 'lib64', 'stubs')
+            if os.path.isdir(stubs_dir):
+                ldflags = [f'-L{stubs_dir}'] + ldflags
     elif os.name == 'nt':
         ldflags = ['cuda.lib', 'advapi32.lib', 'nvrtc.lib']
 
@@ -73,14 +83,15 @@ def _get_plugin():
     except:
         pass
 
-    # Compile and load.
+    # Compile and load. We must use load()'s return value as the module: a
+    # bare `import renderutils_plugin` afterwards depends on PyTorch's internal
+    # sys.modules / sys.path bookkeeping, which is not reliable across torch
+    # versions and recent JIT cache layouts (manifests as ModuleNotFoundError
+    # right after a successful 8/8 ninja build).
     source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
-    torch.utils.cpp_extension.load(name='renderutils_plugin', sources=source_paths, extra_cflags=opts,
-         extra_cuda_cflags=opts, extra_ldflags=ldflags, with_cuda=True, verbose=True)
-
-    # Import, cache, and return the compiled module.
-    import renderutils_plugin
-    _cached_plugin = renderutils_plugin
+    _cached_plugin = torch.utils.cpp_extension.load(
+        name='renderutils_plugin', sources=source_paths, extra_cflags=opts,
+        extra_cuda_cflags=opts, extra_ldflags=ldflags, with_cuda=True, verbose=True)
     return _cached_plugin
 
 #----------------------------------------------------------------------------

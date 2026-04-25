@@ -356,8 +356,13 @@ def SH_proj_v3(func,coords,width):
 	coeffs = np.stack(coeffs,axis=0)
 	return coeffs    
 
-import pyshtools as pysh
+# Lazy import: pyshtools' top-level __init__ imports `constants` which
+# requires astropy (and indirectly pyerfa/xarray). rotateSH is the only
+# caller and is currently unused in the train/render paths, so importing
+# pyshtools at module load would force those scientific deps for no reason.
 def rotateSH(sh_input, rot_angle, rot_axis):
+    import pyshtools as pysh
+
     ls = np.array([0, 1, 1, 1, 2, 2, 2, 2, 2])
     ms = np.array([0, -1, 0, 1, -2, -1, 0, 1, 2])
     mneg_mask = (ms < 0).astype(np.int64)
