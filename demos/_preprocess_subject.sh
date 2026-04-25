@@ -32,6 +32,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+mkdir -p "${ROOT}"
+ROOT="$(cd "${ROOT}" && pwd)"
+
 DATA_DIR="${ROOT}/${NAME}"
 DECA_DIR="${REPO_ROOT}/preprocess/submodules/DECA"
 mkdir -p "${DATA_DIR}"
@@ -51,6 +54,10 @@ echo "[preprocess 2/5] DECA initial FLAME"
       -i "${DATA_DIR}/image" \
       --savefolder "${DATA_DIR}/deca" \
       --saveCode True --saveVis False --sample_step 1 --render_orig False )
+if [[ ! -f "${DATA_DIR}/code.json" ]]; then
+  echo "ERROR: DECA did not produce ${DATA_DIR}/code.json (step 2 failed silently)" >&2
+  exit 1
+fi
 
 echo "[preprocess 3/5] face-alignment landmarks"
 python preprocess/keypoint_detector.py --path "${DATA_DIR}"
