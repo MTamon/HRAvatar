@@ -83,14 +83,15 @@ def _get_plugin():
     except:
         pass
 
-    # Compile and load.
+    # Compile and load. We must use load()'s return value as the module: a
+    # bare `import renderutils_plugin` afterwards depends on PyTorch's internal
+    # sys.modules / sys.path bookkeeping, which is not reliable across torch
+    # versions and recent JIT cache layouts (manifests as ModuleNotFoundError
+    # right after a successful 8/8 ninja build).
     source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
-    torch.utils.cpp_extension.load(name='renderutils_plugin', sources=source_paths, extra_cflags=opts,
-         extra_cuda_cflags=opts, extra_ldflags=ldflags, with_cuda=True, verbose=True)
-
-    # Import, cache, and return the compiled module.
-    import renderutils_plugin
-    _cached_plugin = renderutils_plugin
+    _cached_plugin = torch.utils.cpp_extension.load(
+        name='renderutils_plugin', sources=source_paths, extra_cflags=opts,
+        extra_cuda_cflags=opts, extra_ldflags=ldflags, with_cuda=True, verbose=True)
     return _cached_plugin
 
 #----------------------------------------------------------------------------
