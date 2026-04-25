@@ -398,6 +398,19 @@ fi
 python -m pip install --no-deps ./submodules/diff-gaussian-rasterization_c10
 python -m pip install --no-deps ./submodules/simple-knn
 
+# DECA's standard rasterizer ships only as a CUDA source. Building it here
+# (matching install_128.sh's tail step) avoids torch.utils.cpp_extension.load
+# JIT compilation at first preprocess, where a stale ~/.cache/torch_extensions
+# entry can leave the module un-importable by name.
+DECA_RASTERIZER_DIR="preprocess/submodules/DECA/decalib/utils/rasterizer"
+if [ -f "${DECA_RASTERIZER_DIR}/setup.py" ]; then
+  echo "[5/6] Building DECA standard_rasterize_cuda (prebuilt)"
+  ( cd "${DECA_RASTERIZER_DIR}" && python setup.py build_ext -i )
+else
+  echo "[setup.sh] WARNING: ${DECA_RASTERIZER_DIR} not found — DECA submodule"
+  echo "[setup.sh] not initialized? Run: git submodule update --init --recursive"
+fi
+
 
 # ----------------------------------------------------------------------------
 # 6. Sanity check.
