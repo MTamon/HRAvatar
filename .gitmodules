@@ -4,4 +4,4 @@
 [submodule "preprocess/submodules/DECA"]
 	path = preprocess/submodules/DECA
 	url = git@github.com:MTamon/DECA.git
-	branch = release/cuda128
+	branch = cuda128-HRAvatare
