@@ -48,6 +48,16 @@ def _get_plugin():
     # Linker options.
     if os.name == 'posix':
         ldflags = ['-lcuda', '-lnvrtc']
+        # CUDA 12.x toolkits ship libcuda.so as a link-time stub under
+        # `<CUDA_HOME>/lib64/stubs/` rather than directly in lib64, so
+        # `-lcuda` fails with "cannot find -lcuda" unless we add the
+        # stubs directory to the linker search path. The actual driver
+        # is loaded from /usr/lib at runtime via libcuda.so.1.
+        cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+        if cuda_home:
+            stubs_dir = os.path.join(cuda_home, 'lib64', 'stubs')
+            if os.path.isdir(stubs_dir):
+                ldflags = [f'-L{stubs_dir}'] + ldflags
     elif os.name == 'nt':
         ldflags = ['cuda.lib', 'advapi32.lib', 'nvrtc.lib']
 
