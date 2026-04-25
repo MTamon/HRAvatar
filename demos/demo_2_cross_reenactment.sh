@@ -8,20 +8,21 @@
 # trajectory comes from the source video.
 #
 # Usage:
-#   bash demos/demo_2_cross_reenactment.sh <source_subject_dir> <target_model_dir>
+#   bash demos/demo_2_cross_reenactment.sh <root> <name> <video> <intrinsics> <target_model_dir>
 #
 # Arguments:
-#   source_subject_dir  directory holding the source subject (video.mp4 or
-#                       an already preprocessed tree with tracked_params.json).
-#   target_model_dir    model_path of a trained HRAvatar (output of demo 1).
+#   root         directory that will contain the per-source-subject folder
+#   name         source subject name (sub-directory inside <root>)
+#   video        source input mp4/mov
+#   intrinsics   "hdtf" | "insta" | "custom:fx,fy,cx,cy"
+#   target_model_dir  model_path of a trained HRAvatar (output of demo 1).
 #
 # Environment overrides:
 #   CUDA_VISIBLE_DEVICES  (default 0)
 #   FPS / RESIZE          (defaults 30 / 512)
-#   INTRINSICS            preset for source fitting (default "hdtf")
 #   SKIP_PREPROCESS=1     skip re-running the preprocessing pipeline
 #
-# --- Choice of feature-extraction backend --------------------------------
+# --- Feature-extraction backend note --------------------------------
 # HRAvatar's own `preprocess/` pipeline uses **DECA** for offline per-frame
 # FLAME parameters followed by `optimize.py` for a photometric refinement.
 # That is the canonical extractor both in the upstream README and in
@@ -40,17 +41,15 @@
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
-if [[ $# -lt 2 ]]; then
-  sed -n '2,39p' "$0"
+if [[ $# -lt 5 ]]; then
+  sed -n '2,40p' "$0"
   exit 2
 fi
 
-SRC=$1
-TGT=$2
+ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4; TGT=$5
 : "${CUDA_VISIBLE_DEVICES:=0}"
 : "${FPS:=30}"
 : "${RESIZE:=512}"
-: "${INTRINSICS:=hdtf}"
 : "${SKIP_PREPROCESS:=0}"
 
 export CUDA_VISIBLE_DEVICES
@@ -59,27 +58,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-SRC_NAME="$(basename "${SRC}")"
-SRC_ROOT="$(dirname "${SRC}")"
+DATA_DIR="${ROOT}/${NAME}"
+TRACKED_PARAMS="${DATA_DIR}/tracked_params.json"
+TRACKED_PARAMS_V2="${DATA_DIR}/tracked_params_v2.json"
 
-if [[ "${SKIP_PREPROCESS}" != "1" && ! -f "${SRC}/tracked_params.json" ]]; then
-  VIDEO="${SRC}/video.mp4"
+if [[ "${SKIP_PREPROCESS}" != "1" && ! -f "${TRACKED_PARAMS}" && ! -f "${TRACKED_PARAMS_V2}" ]]; then
   if [[ ! -f "${VIDEO}" ]]; then
-    VIDEO=$(find "${SRC}" -maxdepth 1 -type f \( -iname '*.mp4' -o -iname '*.mov' \) | head -n1)
-  fi
-  if [[ -z "${VIDEO}" ]]; then
-    echo "No video found in ${SRC}; supply a pre-processed directory or drop video.mp4."
+    echo "No video found at ${VIDEO}; provide a source video or use SKIP_PREPROCESS=1 with tracked params in ${DATA_DIR}."
     exit 2
   fi
   FPS="${FPS}" RESIZE="${RESIZE}" WITH_ALBEDO=0 \
     bash demos/_preprocess_subject.sh \
-        "${SRC_ROOT}" "${SRC_NAME}" "${VIDEO}" "${INTRINSICS}"
+        "${ROOT}" "${NAME}" "${VIDEO}" "${INTRINSICS}"
+elif [[ ! -f "${TRACKED_PARAMS}" ]]; then
+  if [[ -f "${TRACKED_PARAMS_V2}" ]]; then
+    echo "[preprocess] skipping; found ${TRACKED_PARAMS_V2}"
+  else
+    echo "No tracked params found in ${DATA_DIR}; cannot render with SKIP_PREPROCESS=1."
+    exit 2
+  fi
+else
+  echo "[preprocess] skipping; found ${TRACKED_PARAMS}"
 fi
 
 python render.py \
     --model_path "${TGT}" \
     --skip_train --skip_test \
-    --corss_source_paths "${SRC}"
+    --corss_source_paths "${DATA_DIR}"
 
 echo
 echo "Done. Renders in ${TGT}/test_cross_reenactment/"

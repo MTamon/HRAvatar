@@ -181,7 +181,7 @@ Extracts features (shape + pose + expression) from a *source* subject's
 video with DECA and renders them through a trained *target* HRAvatar:
 ```shell
 bash demos/demo_2_cross_reenactment.sh \
-     /data/subjects/alice \
+     /data/subjects alice /data/raw/alice.mp4 hdtf \
      outputs/custom/bob
 ```
 The default offline feature extractor is **DECA** (as used by the

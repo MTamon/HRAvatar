@@ -32,7 +32,7 @@ step the structure becomes:
     ├── keypoints/               <- 2D face landmarks
     ├── iris/                    <- iris segmentation
     ├── albedo/                  <- IntrinsicAnything pseudo-GT (optional)
-    └── tracked_params.npz       <- optimised FLAME params (from optimize.py)
+    └── tracked_params.json      <- optimised FLAME params (from optimize.py)
 ```
 
 The cross-reenactment demo uses the same layout for the *source* subject
@@ -76,7 +76,7 @@ Outputs land in `outputs/custom/<subject_name>/`.
 
 Drive a trained HRAvatar with FLAME parameters extracted from a *different*
 person's video.  The script runs the same preprocessing pipeline on the
-source video (to get `tracked_params.npz` + landmarks) and then invokes
+source video when needed (to get `tracked_params.json` + landmarks) and then invokes
 `render.py --corss_source_paths ...` to render frames with the target
 subject's Gaussian head but the source subject's expression trajectory.
 
@@ -92,14 +92,15 @@ Follow the project's convention:
 
 ```bash
 # Arguments:
-#   $1  pre-processed source subject path (the SOURCE of the expression)
-#   $2  trained target HRAvatar model_path
-#   $3  feature-extraction backend: "deca" (default) | "smirk"
+#   $1  path to the directory that will hold the source subject folder
+#   $2  source subject name (the SOURCE of the expression)
+#   $3  path to the source input video file (mp4/mov)
+#   $4  intrinsics preset: "hdtf" | "insta" | "custom:fx,fy,cx,cy"
+#   $5  trained target HRAvatar model_path
 #
 bash demos/demo_2_cross_reenactment.sh \
-    /data/subjects/alice \
-    outputs/custom/bob \
-    deca
+    /data/subjects alice /data/raw/alice.mp4 hdtf \
+    outputs/custom/bob
 ```
 
 Results are written to:
