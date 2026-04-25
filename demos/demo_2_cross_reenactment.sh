@@ -25,7 +25,7 @@
 # HRAvatar's own `preprocess/` pipeline uses **DECA** for offline per-frame
 # FLAME parameters followed by `optimize.py` for a photometric refinement.
 # That is the canonical extractor both in the upstream README and in
-# MTamon/DECA@release/cuda128's `extract_video_params.py`, so we follow
+# MTamon/DECA@cuda128-HRAvatare's `extract_video_params.py`, so we follow
 # exactly that route here.
 #
 # **SMIRK is NOT used as an offline extractor in the reference code.**
