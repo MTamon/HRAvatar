@@ -2,33 +2,76 @@
 # -----------------------------------------------------------------------------
 # Internal helper: run HRAvatar's preprocessing pipeline on a subject.
 #
-# Usage:
-#   bash demos/_preprocess_subject.sh <root> <name> <video> <intrinsics>
-#
-# Arguments + environment: same as demo_1_train_subject.sh (but no train.py).
+# All tunables are CLI flags (not env vars) so a single invocation cannot
+# silently inherit residual state from the surrounding shell. Run with
+# --help for the full list. The only env var honoured is
+# CUDA_VISIBLE_DEVICES (CUDA convention).
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: bash demos/_preprocess_subject.sh <root> <name> <video> <intrinsics> [options]
+
+Required positional arguments:
+  root         dataset output root (per-subject folder created inside)
+  name         subject identifier (sub-directory inside <root>)
+  video        input mp4 / mov
+  intrinsics   "hdtf" | "insta" | "custom:fx,fy,cx,cy"
+
+Optional flags:
+  --fps N                frame extraction fps                  (default 30)
+  --resize N             square crop size in px                (default 512)
+  --with-albedo          run IntrinsicAnything for albedo GT   (default off)
+  --no-stable-bbox       skip the stable bbox preprocess step  (default on)
+  --bbox-verify          also write bbox_verify.mp4 + .csv     (default off)
+  --bbox-cutoff-hz F     FIR LPF cutoff in Hz for bbox.size    (default 2.5)
+  -h, --help             print this message and exit
+
+Honored environment variable:
+  CUDA_VISIBLE_DEVICES   GPU index                             (default 0)
+
+Stable bbox notes:
+  When `--no-stable-bbox` is NOT set (the default), this script computes a
+  temporally smoothed 224-crop bbox sequence in `<root>/<name>/stable_bbox.npz`.
+  DECA's preprocessing reads it (when patched via
+  `tools/patches/apply_deca_stable_bbox.py`) and `scene/data_loader.py`
+  auto-detects it at training time so SMIRK encoder input no longer
+  wobbles with mouth/blink. See `doc/stable_bbox.md`.
+EOF
+}
+
 if [[ $# -lt 4 ]]; then
-  echo "usage: $0 <root> <name> <video> <intrinsics>"
+  usage
   exit 2
 fi
 
 ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4
+shift 4
+
+# Defaults — match what the previous env-var interface defaulted to so the
+# observable behaviour is unchanged for callers that supplied nothing extra.
+FPS=30
+RESIZE=512
+WITH_ALBEDO=0
+STABLE_BBOX=1
+BBOX_VERIFY=0
+BBOX_CUTOFF_HZ=2.5
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fps)             FPS="$2"; shift 2 ;;
+    --resize)          RESIZE="$2"; shift 2 ;;
+    --with-albedo)     WITH_ALBEDO=1; shift ;;
+    --no-stable-bbox)  STABLE_BBOX=0; shift ;;
+    --bbox-verify)     BBOX_VERIFY=1; shift ;;
+    --bbox-cutoff-hz)  BBOX_CUTOFF_HZ="$2"; shift 2 ;;
+    -h|--help)         usage; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
 : "${CUDA_VISIBLE_DEVICES:=0}"
-: "${FPS:=30}"
-: "${RESIZE:=512}"
-: "${WITH_ALBEDO:=0}"
-# `STABLE_BBOX=1` (default) computes a temporally smoothed 224-crop bbox
-# series in `<DATA_DIR>/stable_bbox.npz`. DECA's preprocessing reads it
-# (when patched, see doc/stable_bbox.md) and `scene/data_loader.py` auto-
-# detects it at training time so SMIRK encoder input no longer wobbles
-# with mouth/blink. Set `STABLE_BBOX=0` to skip the step entirely (legacy
-# pipeline). `BBOX_VERIFY=1` additionally writes an overlay mp4 so the
-# stabilization can be eyeballed in motion.
-: "${STABLE_BBOX:=1}"
-: "${BBOX_VERIFY:=0}"
-: "${BBOX_CUTOFF_HZ:=2.5}"
 export CUDA_VISIBLE_DEVICES
 
 case "${INTRINSICS}" in
@@ -71,7 +114,7 @@ if [[ "${STABLE_BBOX}" == "1" ]]; then
   # The DECA fork patched by tools/patches/apply_deca_stable_bbox.py accepts
   # `--precomputed-bbox`. Without the patch the flag is unknown and DECA
   # would error out, so the per-subject script enables it only when
-  # the npz exists AND `STABLE_BBOX=1` was opted into.
+  # the npz exists AND --no-stable-bbox was NOT passed.
   DECA_PRECOMPUTED_BBOX_ARG="--precomputed-bbox ${DATA_DIR}/stable_bbox.npz"
 fi
 

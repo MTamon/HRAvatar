@@ -27,7 +27,7 @@ DECA preprocessing と SMIRK encoder の両方で再利用します。
 | `preprocess/stable_bbox.py` | 2-pass 計算と `stable_bbox.npz` 出力（CLI あり） |
 | `preprocess/bbox_verify.py` | legacy / stable raw / smoothed の比較 mp4 + CSV 出力 |
 | `scene/data_loader.py` | `stable_bbox.npz` を自動検出して per-iter MediaPipe を bypass |
-| `demos/_preprocess_subject.sh` | `STABLE_BBOX=1`（既定）で前処理に組み込み |
+| `demos/_preprocess_subject.sh` | 既定で前処理に組み込み（`--no-stable-bbox` で無効化、`--bbox-verify` で検証動画も生成） |
 | `tools/patches/apply_deca_stable_bbox.py` | DECA 側に `--precomputed-bbox` を追加する冪等な Python パッチャ |
 
 ## 使い方
@@ -38,7 +38,7 @@ DECA preprocessing と SMIRK encoder の両方で再利用します。
 # 前提: DECA fork に stable_bbox 統合を適用しておく（冪等）
 python tools/patches/apply_deca_stable_bbox.py
 
-# あとは普段通り。STABLE_BBOX=1 がデフォルト。
+# あとは普段通り。stable bbox はデフォルトで有効。
 bash demos/demo_1_train_subject.sh <root> <name> <video> hdtf
 ```
 
@@ -58,11 +58,13 @@ bash demos/demo_1_train_subject.sh <root> <name> <video> hdtf
 
 ### オプション
 
-| 環境変数 | 既定 | 意味 |
+`demos/_preprocess_subject.sh` の `--help` で全フラグ一覧が出ます。stable bbox 関連は以下:
+
+| フラグ | 既定 | 意味 |
 |---|---|---|
-| `STABLE_BBOX` | `1` | `0` でこの段階を完全にスキップし、legacy 経路（DECA 内 FAN, data_loader 内 MediaPipe）に戻す |
-| `BBOX_CUTOFF_HZ` | `2.5` | FIR LPF カットオフ。座位で上半身を動かす程度なら既定で十分 |
-| `BBOX_VERIFY` | `0` | `1` で `bbox_verify.mp4` + CSV を `<DATA_DIR>/` に書く |
+| `--no-stable-bbox` | (off) | 指定するとこの段階を完全にスキップし、legacy 経路（DECA 内 FAN, data_loader 内 MediaPipe）に戻す |
+| `--bbox-cutoff-hz F` | `2.5` | FIR LPF カットオフ (Hz)。座位で上半身を動かす程度なら既定で十分 |
+| `--bbox-verify` | (off) | 指定すると `bbox_verify.mp4` + CSV を `<DATA_DIR>/` に書く |
 
 ### 単独実行
 
@@ -119,7 +121,7 @@ taps = next_odd(round(WINDOW_SECONDS * fps))   # WINDOW_SECONDS = 2.0
   停止したいときは npz をリネーム/削除すれば legacy 経路に戻ります。
 - **DECA 側はパッチ配布**: HRAvatar の git submodule を改変する代わりに、
   パッチファイルとして外部配布します。利用者側で適用してください。
-- **後方互換**: `STABLE_BBOX=0` でこの仕組みを完全に無効化できます。
+- **後方互換**: `--no-stable-bbox` でこの仕組みを完全に無効化できます。
   `stable_bbox.npz` を持たない既存 dataset は、`data_loader` 側でも
   legacy MediaPipe + crop_face にフォールバックします。
 
