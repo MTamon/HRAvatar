@@ -1,5 +1,7 @@
 # HRAvatar demos (Python 3.11 + PyTorch 2.9 + CUDA 12.8)
 
+Language: English | [日本語](README.ja.md)
+
 Three demos are provided, mirroring the demo layout used by the companion
 MTamon branches (`MTamon/DECA@release/cuda128`, `MTamon/smirk@release/cuda128`).
 
