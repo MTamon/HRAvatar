@@ -19,6 +19,16 @@ ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4
 : "${FPS:=30}"
 : "${RESIZE:=512}"
 : "${WITH_ALBEDO:=0}"
+# `STABLE_BBOX=1` (default) computes a temporally smoothed 224-crop bbox
+# series in `<DATA_DIR>/stable_bbox.npz`. DECA's preprocessing reads it
+# (when patched, see doc/stable_bbox.md) and `scene/data_loader.py` auto-
+# detects it at training time so SMIRK encoder input no longer wobbles
+# with mouth/blink. Set `STABLE_BBOX=0` to skip the step entirely (legacy
+# pipeline). `BBOX_VERIFY=1` additionally writes an overlay mp4 so the
+# stabilization can be eyeballed in motion.
+: "${STABLE_BBOX:=1}"
+: "${BBOX_VERIFY:=0}"
+: "${BBOX_CUTOFF_HZ:=2.5}"
 export CUDA_VISIBLE_DEVICES
 
 case "${INTRINSICS}" in
@@ -48,12 +58,30 @@ python preprocess/crop_and_matting.py \
     --image_size "${RESIZE}" "${RESIZE}" \
     --matting --crop_image --mask_clothes True
 
+DECA_PRECOMPUTED_BBOX_ARG=""
+if [[ "${STABLE_BBOX}" == "1" ]]; then
+  echo "[preprocess 1.5/5] stable bbox (FlashAvatar PR#7 port)"
+  python preprocess/stable_bbox.py \
+      --source "${DATA_DIR}" --fps "${FPS}" --cutoff_hz "${BBOX_CUTOFF_HZ}"
+  if [[ "${BBOX_VERIFY}" == "1" ]]; then
+    echo "[preprocess 1.5b] bbox verify mp4"
+    python preprocess/bbox_verify.py \
+        --source "${DATA_DIR}" --fps "${FPS}"
+  fi
+  # The DECA fork patched in tmp/hravatar_stable_bbox/deca_stable_bbox.patch
+  # accepts `--precomputed-bbox`. Without the patch the flag is unknown and
+  # DECA would error out, so the per-subject script enables it only when
+  # the npz exists AND `STABLE_BBOX=1` was opted into.
+  DECA_PRECOMPUTED_BBOX_ARG="--precomputed-bbox ${DATA_DIR}/stable_bbox.npz"
+fi
+
 echo "[preprocess 2/5] DECA initial FLAME"
 ( cd "${DECA_DIR}" && \
   python demos/demo_reconstruct.py \
       -i "${DATA_DIR}/image" \
       --savefolder "${DATA_DIR}/deca" \
-      --saveCode True --saveVis False --sample_step 1 --render_orig False )
+      --saveCode True --saveVis False --sample_step 1 --render_orig False \
+      ${DECA_PRECOMPUTED_BBOX_ARG} )
 if [[ ! -f "${DATA_DIR}/code.json" ]]; then
   echo "ERROR: DECA did not produce ${DATA_DIR}/code.json (step 2 failed silently)" >&2
   exit 1
