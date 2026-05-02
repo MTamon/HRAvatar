@@ -28,16 +28,17 @@ DECA preprocessing と SMIRK encoder の両方で再利用します。
 | `preprocess/bbox_verify.py` | legacy / stable raw / smoothed の比較 mp4 + CSV 出力 |
 | `scene/data_loader.py` | `stable_bbox.npz` を自動検出して per-iter MediaPipe を bypass |
 | `demos/_preprocess_subject.sh` | `STABLE_BBOX=1`（既定）で前処理に組み込み |
-| `tmp/hravatar_stable_bbox/deca_stable_bbox.patch` | DECA 側で `--precomputed-bbox` を受け付けるパッチ |
+| `tools/patches/deca-stable-bbox.patch` | DECA 側で `--precomputed-bbox` を受け付けるパッチ |
 
 ## 使い方
 
 ### 通常（demo_1 経由）
 
 ```bash
-# 前提: DECA fork に deca_stable_bbox.patch を当てておく
+# 前提: DECA fork に deca-stable-bbox.patch を当てておく
+# （リポジトリルートからの相対パスで指定）
 cd preprocess/submodules/DECA
-git apply /tmp/hravatar_stable_bbox/deca_stable_bbox.patch
+git apply ../../../tools/patches/deca-stable-bbox.patch
 cd -
 
 # あとは普段通り。STABLE_BBOX=1 がデフォルト。

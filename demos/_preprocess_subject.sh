@@ -68,9 +68,9 @@ if [[ "${STABLE_BBOX}" == "1" ]]; then
     python preprocess/bbox_verify.py \
         --source "${DATA_DIR}" --fps "${FPS}"
   fi
-  # The DECA fork patched in tmp/hravatar_stable_bbox/deca_stable_bbox.patch
-  # accepts `--precomputed-bbox`. Without the patch the flag is unknown and
-  # DECA would error out, so the per-subject script enables it only when
+  # The DECA fork patched in tools/patches/deca-stable-bbox.patch accepts
+  # `--precomputed-bbox`. Without the patch the flag is unknown and DECA
+  # would error out, so the per-subject script enables it only when
   # the npz exists AND `STABLE_BBOX=1` was opted into.
   DECA_PRECOMPUTED_BBOX_ARG="--precomputed-bbox ${DATA_DIR}/stable_bbox.npz"
 fi
