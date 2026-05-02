@@ -48,7 +48,11 @@ Example
 ::
 
     # Preprocess alice once, then just visualize.
-    bash demos/_preprocess_subject.sh /data/subjects alice /data/raw/alice.mp4 hdtf
+    bash demos/_preprocess_subject.sh \\
+        --sbj-root /data/subjects \\
+        --sbj-name alice \\
+        --video /data/raw/alice.mp4 \\
+        --intrinsics hdtf
     python demos/demo_3_overlay_tracking.py \\
         --subject_dir /data/subjects/alice \\
         --output      /tmp/alice_features.mp4 \\

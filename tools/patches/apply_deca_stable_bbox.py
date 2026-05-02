@@ -112,6 +112,11 @@ DATASETS_INIT_PAYLOAD = (
 # comment so the FAN path is bypassed when a precomputed tform is available.
 
 DATASETS_GETITEM_ANCHOR = "# provide kpt as txt file, or mat file (for AFLW2000)"
+# `image_basename` (filename WITH extension) must be in the returned dict —
+# `demos/demo_reconstruct.py` keys `code.json` by it. Earlier versions of this
+# patch returned only `imagename`, which made the short-circuit branch crash
+# with `KeyError: 'image_basename'`. The version-token check in `_patch_file`
+# uses GETITEM_VERSION_TOKEN below to detect that older payload and re-apply.
 DATASETS_GETITEM_PAYLOAD = (
     f'{MARKER}_GETITEM BEGIN — short-circuit FAN with precomputed tform.\n'
     "# If a smoothed similarity transform exists for this frame's basename,\n"
@@ -135,15 +140,18 @@ DATASETS_GETITEM_PAYLOAD = (
     '    dst_image = warp(_hravatar_image, tform.inverse,\n'
     '                     output_shape=(self.resolution_inp, self.resolution_inp))\n'
     '    dst_image = dst_image.transpose(2, 0, 1)\n'
-    '    return {\n'
-    '        "image": torch.tensor(dst_image).float(),\n'
-    '        "imagename": os.path.splitext(_hravatar_basename)[0],\n'
-    '        "image_basename": _hravatar_basename,\n'
-    '        "tform": torch.tensor(tform.params).float(),\n'
-    '        "original_image": torch.tensor(_hravatar_image.transpose(2, 0, 1)).float(),\n'
-    '    }\n'
+    "    return {'image': torch.tensor(dst_image).float(),\n"
+    "            'imagename': os.path.splitext(_hravatar_basename)[0],\n"
+    "            'image_basename': _hravatar_basename,\n"
+    "            'tform': torch.tensor(tform.params).float(),\n"
+    "            'original_image': torch.tensor(_hravatar_image.transpose(2, 0, 1)).float()}\n"
     f'{MARKER}_GETITEM END\n'
 )
+# Substring unique to the current GETITEM payload. Used as a per-file
+# version token to recognise (and upgrade) DECA checkouts that still carry
+# the older payload, which crashed `demo_reconstruct.py` at
+# `testdata[i]["image_basename"]`.
+GETITEM_VERSION_TOKEN = "'image_basename': _hravatar_basename,"
 
 
 # --- Edit 4: demo_reconstruct.py — TestData call gains the new kwarg ------
@@ -176,6 +184,59 @@ DEMO_ARGPARSE_PAYLOAD = (
     "          'sequence consumed by `scene/data_loader.py` at training.'))\n"
     f'{MARKER}_ARG END\n'
 )
+
+
+# --- Revert helpers (used to upgrade in-place over an older patch) -------
+#
+# A previous version of this patcher inserted a GETITEM payload that didn't
+# include `image_basename` in the returned dict, which made
+# `demos/demo_reconstruct.py` crash with `KeyError: 'image_basename'`.
+#
+# Because `_patch_file` is idempotent on `MARKER in text`, simply re-running
+# the patcher won't repair an already-patched checkout — the new payload
+# would never reach the file. Instead, when the marker is present but the
+# current version token isn't, we revert the prior patch in place (strip
+# inserted blocks + undo the signature/call replacements) and then fall
+# through to the normal apply path.
+
+# Match a full `<MARKER>_<NAME> BEGIN ... <MARKER>_<NAME> END\n` block with
+# its leading indentation. `re.DOTALL` lets `.` span newlines; `re.MULTILINE`
+# anchors the leading-indent capture at the start of each line.
+_BLOCK_STRIP_PATTERN = re.compile(
+    r'^[ \t]*' + re.escape(MARKER) + r'_[A-Z]+ BEGIN.*?'
+    + re.escape(MARKER) + r'_[A-Z]+ END[^\n]*\n',
+    re.DOTALL | re.MULTILINE,
+)
+
+
+# Reverse of `DATASETS_INIT_PATTERN` — matches the post-patch `__init__`
+# signature so we can drop the trailing `precomputed_tforms_path=None` kwarg.
+DATASETS_INIT_PATCHED_PATTERN = re.compile(
+    r"def __init__\(self, testpath, iscrop=True, crop_size=224, "
+    r"scale=1\.25, face_detector=([\"'])fan\1, sample_step=10, "
+    r"precomputed_tforms_path=None\):"
+)
+
+
+def _datasets_init_revert(match: re.Match) -> str:
+    quote = match.group(1)
+    return (
+        f"def __init__(self, testpath, iscrop=True, crop_size=224, "
+        f"scale=1.25, face_detector={quote}fan{quote}, sample_step=10):"
+    )
+
+
+def _revert_prior_patch(text: str) -> str:
+    """Return ``text`` with all prior HRAvatar stable_bbox edits undone.
+
+    Safe to call on either patched file (datasets.py or demo_reconstruct.py):
+    each revert step is a no-op if the corresponding edit isn't present, so
+    running this against a partially-patched file leaves it consistent.
+    """
+    text = _BLOCK_STRIP_PATTERN.sub('', text)
+    text = DATASETS_INIT_PATCHED_PATTERN.sub(_datasets_init_revert, text)
+    text = text.replace(DEMO_TESTDATA_NEW, DEMO_TESTDATA_OLD)
+    return text
 
 
 # --- Driver --------------------------------------------------------------
@@ -212,7 +273,11 @@ def _reindent(payload: str, indent: str) -> str:
     return joined
 
 
-def _patch_file(path: Path, edits: list[tuple]) -> bool:
+def _patch_file(
+    path: Path,
+    edits: list[tuple],
+    version_token: str | None = None,
+) -> bool:
     """Apply ``[(op, find, payload_or_replacement), ...]`` to ``path``.
 
     Operations:
@@ -230,15 +295,26 @@ def _patch_file(path: Path, edits: list[tuple]) -> bool:
         line containing `find` (a string), then inserted on a new line
         immediately before that line.
 
-    Idempotent at the file level — if the marker is already present
-    anywhere in the file, the edits are skipped wholesale.
+    Idempotency / upgrade:
+
+      * If the marker is absent, the edits are applied fresh.
+      * If the marker is present and ``version_token`` is None or already
+        appears in the file, the file is left alone (already up-to-date).
+      * If the marker is present but ``version_token`` is missing, the
+        prior patch is reverted in place via ``_revert_prior_patch`` and
+        the edits are then re-applied — this is how a checkout patched by
+        an older version of this script gets upgraded.
 
     Returns True if the file was modified, False if it was already patched.
     """
     text = path.read_text()
     if MARKER in text:
-        print(f'[skip] {path} already patched ({MARKER} present)')
-        return False
+        if version_token is None or version_token in text:
+            print(f'[skip] {path} already patched ({MARKER} present)')
+            return False
+        print(f'[upgrade] {path} carries an older patch — '
+              f'reverting and re-applying')
+        text = _revert_prior_patch(text)
 
     for op, find, payload in edits:
         if op == 'replace_re':
@@ -310,11 +386,14 @@ def main(argv: list[str] | None = None) -> int:
                 f'        is {deca_root} the DECA root?')
 
     any_changed = False
+    # `version_token` only set on datasets.py because that's the file whose
+    # payload changed (image_basename added). demo_reconstruct.py's payload
+    # is unchanged, so MARKER-presence alone is enough to skip it.
     any_changed |= _patch_file(datasets_py, [
         ('replace_re', DATASETS_INIT_PATTERN, _datasets_init_replace),
         ('insert_before', DATASETS_INIT_ANCHOR, DATASETS_INIT_PAYLOAD),
         ('insert_before', DATASETS_GETITEM_ANCHOR, DATASETS_GETITEM_PAYLOAD),
-    ])
+    ], version_token=GETITEM_VERSION_TOKEN)
     any_changed |= _patch_file(demo_py, [
         ('replace', DEMO_TESTDATA_OLD, DEMO_TESTDATA_NEW),
         ('insert_before', DEMO_ARGPARSE_ANCHOR, DEMO_ARGPARSE_PAYLOAD),
