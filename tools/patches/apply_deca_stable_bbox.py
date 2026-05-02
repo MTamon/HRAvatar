@@ -149,9 +149,26 @@ DATASETS_GETITEM_PAYLOAD = (
 )
 # Substring unique to the current GETITEM payload. Used as a per-file
 # version token to recognise (and upgrade) DECA checkouts that still carry
-# the older payload, which crashed `demo_reconstruct.py` at
-# `testdata[i]["image_basename"]`.
-GETITEM_VERSION_TOKEN = "'image_basename': _hravatar_basename,"
+# an older payload. Two known older payload variants exist:
+#
+#   v0 — pre-image_basename. `demo_reconstruct.py` crashed at
+#        `testdata[i]["image_basename"]` because the dict was missing that key.
+#
+#   v1 — post-image_basename, but `original_image` field still wrapped the raw
+#        uint8 `image` instead of the `_hravatar_image = image / 255.0`
+#        normalisation that the warp input uses. Functionally fine when DECA
+#        is run with `--render_orig False` (preprocessing path), but
+#        inconsistent with the FAN-path return value, which DOES normalise
+#        before packing `original_image`. With `--render_orig True` the
+#        unnormalised value would overflow downstream compositing.
+#
+# The token below is the unique substring of the *current* (v2) payload —
+# it references `_hravatar_image.transpose(...)` for `original_image`,
+# matching the FAN path. Upgrading from either v0 or v1 triggers
+# `_revert_prior_patch` followed by re-application of the v2 payload.
+GETITEM_VERSION_TOKEN = (
+    "'original_image': torch.tensor(_hravatar_image.transpose(2, 0, 1)).float()"
+)
 
 
 # --- Edit 4: demo_reconstruct.py — TestData call gains the new kwarg ------
