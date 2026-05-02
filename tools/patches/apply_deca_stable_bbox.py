@@ -118,6 +118,11 @@ DATASETS_GETITEM_PAYLOAD = (
     '# skip detection and warp directly. Downstream `code.json` `tform`\n'
     '# then reflects the stabilised crop, so `optimize.py` and HRAvatar\n'
     '# training all see the same (center, size) sequence frame-to-frame.\n'
+    '#\n'
+    '# Returned dict mirrors the FAN-path return dict below verbatim — same\n'
+    '# keys ("imagename", "image_basename", "image", "tform",\n'
+    '# "original_image"), so demo_reconstruct.py and optimize.py treat the\n'
+    '# short-circuited frames identically to the FAN-detected ones.\n'
     '_hravatar_basename = os.path.basename(imagepath)\n'
     'if (self._precomputed_tforms is not None\n'
     '        and _hravatar_basename in self._precomputed_tforms):\n'
@@ -126,13 +131,17 @@ DATASETS_GETITEM_PAYLOAD = (
     '                               np.eye(3)[:2, :2],\n'
     '                               np.eye(3)[:2, :2])\n'
     '    tform.params[:] = _hravatar_params\n'
-    '    dst_image = warp(image, tform.inverse,\n'
-    '                     output_shape=(self.crop_size, self.crop_size))\n'
+    '    _hravatar_image = image / 255.0\n'
+    '    dst_image = warp(_hravatar_image, tform.inverse,\n'
+    '                     output_shape=(self.resolution_inp, self.resolution_inp))\n'
     '    dst_image = dst_image.transpose(2, 0, 1)\n'
-    "    return {'image': torch.tensor(dst_image).float(),\n"
-    "            'imagename': os.path.splitext(_hravatar_basename)[0],\n"
-    "            'tform': torch.tensor(tform.params).float(),\n"
-    "            'original_image': torch.tensor(image.transpose(2, 0, 1)).float()}\n"
+    '    return {\n'
+    '        "image": torch.tensor(dst_image).float(),\n'
+    '        "imagename": os.path.splitext(_hravatar_basename)[0],\n'
+    '        "image_basename": _hravatar_basename,\n'
+    '        "tform": torch.tensor(tform.params).float(),\n'
+    '        "original_image": torch.tensor(_hravatar_image.transpose(2, 0, 1)).float(),\n'
+    '    }\n'
     f'{MARKER}_GETITEM END\n'
 )
 
