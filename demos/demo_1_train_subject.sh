@@ -30,6 +30,12 @@ ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4
 : "${CUDA_VISIBLE_DEVICES:=0}"
 : "${EPOCHS:=15}"
 : "${SKIP_PREPROCESS:=0}"
+# Forwarded to _preprocess_subject.sh as flags (the env-var interface there
+# was retired to avoid residual / typo risk; we still accept the env-var
+# inputs here for backward compatibility with existing automation).
+: "${FPS:=30}"
+: "${RESIZE:=512}"
+: "${WITH_ALBEDO:=0}"
 export CUDA_VISIBLE_DEVICES
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +46,13 @@ DATA_DIR="${ROOT}/${NAME}"
 MODEL_DIR="${REPO_ROOT}/outputs/custom/${NAME}"
 
 if [[ "${SKIP_PREPROCESS}" != "1" ]]; then
-  bash demos/_preprocess_subject.sh "${ROOT}" "${NAME}" "${VIDEO}" "${INTRINSICS}"
+  PREPROCESS_FLAGS=(--fps "${FPS}" --resize "${RESIZE}")
+  if [[ "${WITH_ALBEDO}" == "1" ]]; then
+    PREPROCESS_FLAGS+=(--with-albedo)
+  fi
+  bash demos/_preprocess_subject.sh \
+      "${ROOT}" "${NAME}" "${VIDEO}" "${INTRINSICS}" \
+      "${PREPROCESS_FLAGS[@]}"
 fi
 
 echo "[train] HRAvatar"

@@ -67,9 +67,9 @@ if [[ "${SKIP_PREPROCESS}" != "1" && ! -f "${TRACKED_PARAMS}" && ! -f "${TRACKED
     echo "No video found at ${VIDEO}; provide a source video or use SKIP_PREPROCESS=1 with tracked params in ${DATA_DIR}."
     exit 2
   fi
-  FPS="${FPS}" RESIZE="${RESIZE}" WITH_ALBEDO=0 \
-    bash demos/_preprocess_subject.sh \
-        "${ROOT}" "${NAME}" "${VIDEO}" "${INTRINSICS}"
+  bash demos/_preprocess_subject.sh \
+      "${ROOT}" "${NAME}" "${VIDEO}" "${INTRINSICS}" \
+      --fps "${FPS}" --resize "${RESIZE}"
 elif [[ ! -f "${TRACKED_PARAMS}" ]]; then
   if [[ -f "${TRACKED_PARAMS_V2}" ]]; then
     echo "[preprocess] skipping; found ${TRACKED_PARAMS_V2}"
