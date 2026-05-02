@@ -47,15 +47,14 @@ whose expressions are transferred to the avatar of the *target* subject.
 `demos/demo_1_train_subject.sh`
 
 ```bash
-# Arguments:
-#   $1  path to the directory that will hold the subject folder
-#   $2  subject name (the sub-directory under $1)
-#   $3  path to the input video file (mp4/mov)
-#   $4  intrinsics preset: "hdtf" | "insta" | "custom:fx,fy,cx,cy"
-#
 bash demos/demo_1_train_subject.sh \
-    /data/subjects alice /data/raw/alice.mp4 hdtf
+    --subject-root /data/subjects \
+    --subject-name alice \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf
 ```
+
+The older positional form is still accepted for existing automation.
 
 The script performs these steps:
 
@@ -65,7 +64,7 @@ The script performs these steps:
 3. `preprocess/keypoint_detector.py` — 68-point landmarks with face-alignment.
 4. `preprocess/iris.py` — iris segmentation with FDLite.
 5. `preprocess/submodules/DECA/optimize.py` — photometric FLAME fit.
-6. *(optional, enabled with `--with_albedo`)*
+6. *(optional, enabled with `--with-albedo`)*
    `preprocess/submodules/IntrinsicAnything/inference.py` — albedo pseudo-GT.
 7. `train.py` — HRAvatar training (15 epochs by default, `--epochs` override).
 8. `render.py` — self-reenactment renders + metrics.
@@ -93,17 +92,15 @@ Follow the project's convention:
   It is not used for offline feature extraction in the reference code.
 
 ```bash
-# Arguments:
-#   $1  path to the directory that will hold the source subject folder
-#   $2  source subject name (the SOURCE of the expression)
-#   $3  path to the source input video file (mp4/mov)
-#   $4  intrinsics preset: "hdtf" | "insta" | "custom:fx,fy,cx,cy"
-#   $5  trained target HRAvatar model_path
-#
 bash demos/demo_2_cross_reenactment.sh \
-    /data/subjects alice /data/raw/alice.mp4 hdtf \
-    outputs/custom/bob
+    --subject-root /data/subjects \
+    --subject-name alice \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf \
+    --target-model-dir outputs/custom/bob
 ```
+
+The older positional form is still accepted for existing automation.
 
 Results are written to:
 
@@ -142,7 +139,11 @@ will reproduce it.
 
 ```bash
 # 1) preprocess once (reuse the helper used by demo 1)
-bash demos/_preprocess_subject.sh /data/subjects alice /data/raw/alice.mp4 hdtf
+bash demos/_preprocess_subject.sh \
+    --subject-root /data/subjects \
+    --subject-name alice \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf
 
 # 2) inspect the features fed to the renderer
 python demos/demo_3_overlay_tracking.py \

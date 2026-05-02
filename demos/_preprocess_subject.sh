@@ -11,13 +11,22 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bash demos/_preprocess_subject.sh <root> <name> <video> <intrinsics> [options]
+Usage:
+  bash demos/_preprocess_subject.sh \
+      --sbj-root <root> \
+      --sbj-name <name> \
+      --video <video> \
+      --intrinsics <intrinsics> \
+      [options]
 
-Required positional arguments:
-  root         dataset output root (per-subject folder created inside)
-  name         subject identifier (sub-directory inside <root>)
-  video        input mp4 / mov
-  intrinsics   "hdtf" | "insta" | "custom:fx,fy,cx,cy"
+Legacy positional form is also accepted:
+  bash demos/_preprocess_subject.sh <root> <name> <video> <intrinsics> [options]
+
+Required arguments:
+  --sbj-root PATH    dataset output root (per-subject folder created inside)
+  --sbj-name NAME    subject identifier (sub-directory inside <root>)
+  --video PATH           input mp4 / mov
+  --intrinsics VALUE     "hdtf" | "insta" | "custom:fx,fy,cx,cy"
 
 Optional flags:
   --fps N                frame extraction fps                  (default 30)
@@ -41,16 +50,12 @@ Stable bbox notes:
 EOF
 }
 
-if [[ $# -lt 4 ]]; then
-  usage
-  exit 2
-fi
-
-ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4
-shift 4
-
 # Defaults — match what the previous env-var interface defaulted to so the
 # observable behaviour is unchanged for callers that supplied nothing extra.
+ROOT=""
+NAME=""
+VIDEO=""
+INTRINSICS=""
 FPS=30
 RESIZE=512
 WITH_ALBEDO=0
@@ -58,18 +63,50 @@ STABLE_BBOX=1
 BBOX_VERIFY=0
 BBOX_CUTOFF_HZ=2.5
 
+POSITIONAL=()
+
+require_value() {
+  if [[ $# -lt 2 || "$2" == --* ]]; then
+    echo "missing value for $1" >&2
+    usage
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --fps)             FPS="$2"; shift 2 ;;
-    --resize)          RESIZE="$2"; shift 2 ;;
-    --with-albedo)     WITH_ALBEDO=1; shift ;;
+    --sbj-root)    require_value "$@"; ROOT="$2"; shift 2 ;;
+    --sbj-name)    require_value "$@"; NAME="$2"; shift 2 ;;
+    --video)           require_value "$@"; VIDEO="$2"; shift 2 ;;
+    --intrinsics)      require_value "$@"; INTRINSICS="$2"; shift 2 ;;
+    --fps)             require_value "$@"; FPS="$2"; shift 2 ;;
+    --resize)          require_value "$@"; RESIZE="$2"; shift 2 ;;
+    --with-albedo|--with_albedo) WITH_ALBEDO=1; shift ;;
     --no-stable-bbox)  STABLE_BBOX=0; shift ;;
     --bbox-verify)     BBOX_VERIFY=1; shift ;;
-    --bbox-cutoff-hz)  BBOX_CUTOFF_HZ="$2"; shift 2 ;;
+    --bbox-cutoff-hz)  require_value "$@"; BBOX_CUTOFF_HZ="$2"; shift 2 ;;
     -h|--help)         usage; exit 0 ;;
-    *) echo "unknown flag: $1" >&2; usage; exit 2 ;;
+    --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
   esac
 done
+
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+  if [[ ${#POSITIONAL[@]} -ne 4 ]]; then
+    echo "expected exactly 4 positional arguments: <root> <name> <video> <intrinsics>" >&2
+    usage
+    exit 2
+  fi
+  [[ -z "${ROOT}" ]] && ROOT="${POSITIONAL[0]}"
+  [[ -z "${NAME}" ]] && NAME="${POSITIONAL[1]}"
+  [[ -z "${VIDEO}" ]] && VIDEO="${POSITIONAL[2]}"
+  [[ -z "${INTRINSICS}" ]] && INTRINSICS="${POSITIONAL[3]}"
+fi
+
+if [[ -z "${ROOT}" || -z "${NAME}" || -z "${VIDEO}" || -z "${INTRINSICS}" ]]; then
+  usage
+  exit 2
+fi
 
 : "${CUDA_VISIBLE_DEVICES:=0}"
 export CUDA_VISIBLE_DEVICES

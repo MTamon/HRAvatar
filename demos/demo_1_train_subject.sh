@@ -3,15 +3,29 @@
 # demo 1 — End-to-end HRAvatar training on a single subject's video.
 #
 # Usage:
+#   bash demos/demo_1_train_subject.sh \
+#       --sbj-root <root> \
+#       --sbj-name <name> \
+#       --video <video> \
+#       --intrinsics <intrinsics>
+#
+# Legacy positional form is also accepted:
 #   bash demos/demo_1_train_subject.sh <root> <name> <video> <intrinsics>
 #
 # Arguments:
-#   root         directory that will contain the per-subject folder
-#   name         subject name (sub-directory inside <root>)
-#   video        input mp4/mov
-#   intrinsics   "hdtf" | "insta" | "custom:fx,fy,cx,cy"
+#   --sbj-root PATH  directory that will contain the per-subject folder
+#   --sbj-name NAME  subject name (sub-directory inside <root>)
+#   --video PATH         input mp4/mov
+#   --intrinsics VALUE   "hdtf" | "insta" | "custom:fx,fy,cx,cy"
 #
-# Environment overrides:
+# Optional flags:
+#   --fps N              frame-rate for frame extraction (default 30)
+#   --resize N           square crop size (default 512)
+#   --epochs N           training epochs (default 15)
+#   --with-albedo        run IntrinsicAnything for albedo pseudo-GT
+#   --skip-preprocess    skip preprocessing (already done)
+#
+# Environment overrides still accepted for backward compatibility:
 #   CUDA_VISIBLE_DEVICES  (default 0)
 #   FPS                   frame-rate for frame extraction (default 30)
 #   RESIZE                square crop size (default 512)
@@ -21,12 +35,14 @@
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
-if [[ $# -lt 4 ]]; then
-  sed -n '2,20p' "$0"
-  exit 2
-fi
+usage() {
+  sed -n '2,32p' "$0"
+}
 
-ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4
+ROOT=""
+NAME=""
+VIDEO=""
+INTRINSICS=""
 : "${CUDA_VISIBLE_DEVICES:=0}"
 : "${EPOCHS:=15}"
 : "${SKIP_PREPROCESS:=0}"
@@ -37,6 +53,50 @@ ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4
 : "${RESIZE:=512}"
 : "${WITH_ALBEDO:=0}"
 export CUDA_VISIBLE_DEVICES
+
+POSITIONAL=()
+
+require_value() {
+  if [[ $# -lt 2 || "$2" == --* ]]; then
+    echo "missing value for $1" >&2
+    usage
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sbj-root)    require_value "$@"; ROOT="$2"; shift 2 ;;
+    --sbj-name)    require_value "$@"; NAME="$2"; shift 2 ;;
+    --video)           require_value "$@"; VIDEO="$2"; shift 2 ;;
+    --intrinsics)      require_value "$@"; INTRINSICS="$2"; shift 2 ;;
+    --fps)             require_value "$@"; FPS="$2"; shift 2 ;;
+    --resize)          require_value "$@"; RESIZE="$2"; shift 2 ;;
+    --epochs)          require_value "$@"; EPOCHS="$2"; shift 2 ;;
+    --with-albedo|--with_albedo) WITH_ALBEDO=1; shift ;;
+    --skip-preprocess) SKIP_PREPROCESS=1; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+  if [[ ${#POSITIONAL[@]} -ne 4 ]]; then
+    echo "expected exactly 4 positional arguments: <root> <name> <video> <intrinsics>" >&2
+    usage
+    exit 2
+  fi
+  [[ -z "${ROOT}" ]] && ROOT="${POSITIONAL[0]}"
+  [[ -z "${NAME}" ]] && NAME="${POSITIONAL[1]}"
+  [[ -z "${VIDEO}" ]] && VIDEO="${POSITIONAL[2]}"
+  [[ -z "${INTRINSICS}" ]] && INTRINSICS="${POSITIONAL[3]}"
+fi
+
+if [[ -z "${ROOT}" || -z "${NAME}" || -z "${VIDEO}" || -z "${INTRINSICS}" ]]; then
+  usage
+  exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -51,7 +111,10 @@ if [[ "${SKIP_PREPROCESS}" != "1" ]]; then
     PREPROCESS_FLAGS+=(--with-albedo)
   fi
   bash demos/_preprocess_subject.sh \
-      "${ROOT}" "${NAME}" "${VIDEO}" "${INTRINSICS}" \
+      --sbj-root "${ROOT}" \
+      --sbj-name "${NAME}" \
+      --video "${VIDEO}" \
+      --intrinsics "${INTRINSICS}" \
       "${PREPROCESS_FLAGS[@]}"
 fi
 

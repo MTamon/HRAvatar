@@ -47,15 +47,14 @@
 `demos/demo_1_train_subject.sh`
 
 ```bash
-# Arguments:
-#   $1  subject フォルダを格納するディレクトリへのパス
-#   $2  subject 名 ($1 配下のサブディレクトリ名)
-#   $3  入力動画ファイルへのパス (mp4/mov)
-#   $4  intrinsics preset: "hdtf" | "insta" | "custom:fx,fy,cx,cy"
-#
 bash demos/demo_1_train_subject.sh \
-    /data/subjects alice /data/raw/alice.mp4 hdtf
+    --subject-root /data/subjects \
+    --subject-name alice \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf
 ```
+
+既存の自動化向けに、従来の位置引数形式も引き続き使用できます。
 
 このスクリプトは次の処理を実行します。
 
@@ -65,7 +64,7 @@ bash demos/demo_1_train_subject.sh \
 3. `preprocess/keypoint_detector.py` - face-alignment による 68 点ランドマーク。
 4. `preprocess/iris.py` - FDLite による虹彩セグメンテーション。
 5. `preprocess/submodules/DECA/optimize.py` - photometric FLAME fit。
-6. *(任意、`--with_albedo` で有効)*
+6. *(任意、`--with-albedo` で有効)*
    `preprocess/submodules/IntrinsicAnything/inference.py` - albedo pseudo-GT。
 7. `train.py` - HRAvatar の学習 (デフォルト 15 epochs、`--epochs` で上書き可能)。
 8. `render.py` - self-reenactment のレンダリングと metrics。
@@ -93,17 +92,15 @@ SMIRK (`net_modules/flame_params_net_smirk.py`) の両方が含まれていま�
   リファレンスコードでは、オフライン特徴量抽出には使いません。
 
 ```bash
-# Arguments:
-#   $1  source subject フォルダを格納するディレクトリへのパス
-#   $2  source subject 名 (表情の SOURCE)
-#   $3  source 入力動画ファイルへのパス (mp4/mov)
-#   $4  intrinsics preset: "hdtf" | "insta" | "custom:fx,fy,cx,cy"
-#   $5  学習済み target HRAvatar の model_path
-#
 bash demos/demo_2_cross_reenactment.sh \
-    /data/subjects alice /data/raw/alice.mp4 hdtf \
-    outputs/custom/bob
+    --subject-root /data/subjects \
+    --subject-name alice \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf \
+    --target-model-dir outputs/custom/bob
 ```
+
+既存の自動化向けに、従来の位置引数形式も引き続き使用できます。
 
 結果は次の場所に書き込まれます。
 
@@ -140,7 +137,11 @@ HRAvatar でも同じ動きが再現されます。
 
 ```bash
 # 1) 一度だけ前処理する (demo 1 と同じ helper を再利用)
-bash demos/_preprocess_subject.sh /data/subjects alice /data/raw/alice.mp4 hdtf
+bash demos/_preprocess_subject.sh \
+    --subject-root /data/subjects \
+    --subject-name alice \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf
 
 # 2) レンダラへ渡される特徴量を確認する
 python demos/demo_3_overlay_tracking.py \

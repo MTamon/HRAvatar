@@ -8,16 +8,29 @@
 # trajectory comes from the source video.
 #
 # Usage:
+#   bash demos/demo_2_cross_reenactment.sh \
+#       --sbj-root <root> \
+#       --sbj-name <name> \
+#       --video <video> \
+#       --intrinsics <intrinsics> \
+#       --target-model-dir <target_model_dir>
+#
+# Legacy positional form is also accepted:
 #   bash demos/demo_2_cross_reenactment.sh <root> <name> <video> <intrinsics> <target_model_dir>
 #
 # Arguments:
-#   root         directory that will contain the per-source-subject folder
-#   name         source subject name (sub-directory inside <root>)
-#   video        source input mp4/mov
-#   intrinsics   "hdtf" | "insta" | "custom:fx,fy,cx,cy"
-#   target_model_dir  model_path of a trained HRAvatar (output of demo 1).
+#   --sbj-root PATH      directory that will contain the per-source-subject folder
+#   --sbj-name NAME      source subject name (sub-directory inside <root>)
+#   --video PATH             source input mp4/mov
+#   --intrinsics VALUE       "hdtf" | "insta" | "custom:fx,fy,cx,cy"
+#   --target-model-dir PATH  model_path of a trained HRAvatar (output of demo 1).
 #
-# Environment overrides:
+# Optional flags:
+#   --fps N                  frame-rate for frame extraction (default 30)
+#   --resize N               square crop size (default 512)
+#   --skip-preprocess        skip re-running the preprocessing pipeline
+#
+# Environment overrides still accepted for backward compatibility:
 #   CUDA_VISIBLE_DEVICES  (default 0)
 #   FPS / RESIZE          (defaults 30 / 512)
 #   SKIP_PREPROCESS=1     skip re-running the preprocessing pipeline
@@ -41,18 +54,65 @@
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
-if [[ $# -lt 5 ]]; then
-  sed -n '2,40p' "$0"
-  exit 2
-fi
+usage() {
+  sed -n '2,44p' "$0"
+}
 
-ROOT=$1; NAME=$2; VIDEO=$3; INTRINSICS=$4; TGT=$5
+ROOT=""
+NAME=""
+VIDEO=""
+INTRINSICS=""
+TGT=""
 : "${CUDA_VISIBLE_DEVICES:=0}"
 : "${FPS:=30}"
 : "${RESIZE:=512}"
 : "${SKIP_PREPROCESS:=0}"
 
 export CUDA_VISIBLE_DEVICES
+
+POSITIONAL=()
+
+require_value() {
+  if [[ $# -lt 2 || "$2" == --* ]]; then
+    echo "missing value for $1" >&2
+    usage
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sbj-root)     require_value "$@"; ROOT="$2"; shift 2 ;;
+    --sbj-name)     require_value "$@"; NAME="$2"; shift 2 ;;
+    --video)            require_value "$@"; VIDEO="$2"; shift 2 ;;
+    --intrinsics)       require_value "$@"; INTRINSICS="$2"; shift 2 ;;
+    --target-model-dir) require_value "$@"; TGT="$2"; shift 2 ;;
+    --fps)              require_value "$@"; FPS="$2"; shift 2 ;;
+    --resize)           require_value "$@"; RESIZE="$2"; shift 2 ;;
+    --skip-preprocess)  SKIP_PREPROCESS=1; shift ;;
+    -h|--help)          usage; exit 0 ;;
+    --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+  if [[ ${#POSITIONAL[@]} -ne 5 ]]; then
+    echo "expected exactly 5 positional arguments: <root> <name> <video> <intrinsics> <target_model_dir>" >&2
+    usage
+    exit 2
+  fi
+  [[ -z "${ROOT}" ]] && ROOT="${POSITIONAL[0]}"
+  [[ -z "${NAME}" ]] && NAME="${POSITIONAL[1]}"
+  [[ -z "${VIDEO}" ]] && VIDEO="${POSITIONAL[2]}"
+  [[ -z "${INTRINSICS}" ]] && INTRINSICS="${POSITIONAL[3]}"
+  [[ -z "${TGT}" ]] && TGT="${POSITIONAL[4]}"
+fi
+
+if [[ -z "${ROOT}" || -z "${NAME}" || -z "${VIDEO}" || -z "${INTRINSICS}" || -z "${TGT}" ]]; then
+  usage
+  exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -68,7 +128,10 @@ if [[ "${SKIP_PREPROCESS}" != "1" && ! -f "${TRACKED_PARAMS}" && ! -f "${TRACKED
     exit 2
   fi
   bash demos/_preprocess_subject.sh \
-      "${ROOT}" "${NAME}" "${VIDEO}" "${INTRINSICS}" \
+      --sbj-root "${ROOT}" \
+      --sbj-name "${NAME}" \
+      --video "${VIDEO}" \
+      --intrinsics "${INTRINSICS}" \
       --fps "${FPS}" --resize "${RESIZE}"
 elif [[ ! -f "${TRACKED_PARAMS}" ]]; then
   if [[ -f "${TRACKED_PARAMS_V2}" ]]; then
