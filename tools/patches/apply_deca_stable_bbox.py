@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -49,15 +50,24 @@ MARKER = '# HRAVATAR_STABLE_BBOX'
 # code-style differences (tabs vs 4 spaces vs 2 spaces) across forks.
 
 # --- Edit 1: TestData.__init__ signature gains an optional kwarg ----------
+#
+# Match using a regex because forks differ on quote style for the
+# `face_detector` default (yfeng95: 'fan'; MTamon HRAvatar fork: "fan").
+# The pattern is anchored on the unique substring
+# "def __init__(self, testpath, iscrop=" so it can't pick up the wrong
+# `__init__`, but tolerates both quote styles inside.
 
-DATASETS_INIT_OLD = (
-    "def __init__(self, testpath, iscrop=True, crop_size=224, scale=1.25, "
-    "face_detector='fan', sample_step=10):"
+DATASETS_INIT_PATTERN = re.compile(
+    r"def __init__\(self, testpath, iscrop=True, crop_size=224, "
+    r"scale=1\.25, face_detector=([\"'])fan\1, sample_step=10\):"
 )
-DATASETS_INIT_NEW = (
-    "def __init__(self, testpath, iscrop=True, crop_size=224, scale=1.25, "
-    "face_detector='fan', sample_step=10, precomputed_tforms_path=None):"
-)
+def _datasets_init_replace(match: re.Match) -> str:
+    quote = match.group(1)
+    return (
+        f"def __init__(self, testpath, iscrop=True, crop_size=224, "
+        f"scale=1.25, face_detector={quote}fan{quote}, sample_step=10, "
+        f"precomputed_tforms_path=None):"
+    )
 
 
 # --- Edit 2: __init__ body — load the npz once and stash a basename->tform map.
@@ -193,17 +203,23 @@ def _reindent(payload: str, indent: str) -> str:
     return joined
 
 
-def _patch_file(path: Path, edits: list[tuple[str, str, str]]) -> bool:
+def _patch_file(path: Path, edits: list[tuple]) -> bool:
     """Apply ``[(op, find, payload_or_replacement), ...]`` to ``path``.
 
     Operations:
 
-      * ``replace`` — `find` must occur exactly once and is replaced verbatim.
+      * ``replace`` — `find` (a string) must occur exactly once and is
+        replaced verbatim by `payload_or_replacement`.
+      * ``replace_re`` — `find` is a compiled regex. It must match exactly
+        once (`re.findall` length == 1). The `payload_or_replacement` is
+        a callable taking the match object and returning the replacement
+        string. Use this when forks differ in surface form (e.g. quote
+        style) but the meaning is the same.
       * ``insert_after`` — payload is reindented to the line indent of the
-        line containing `find`, then inserted after that line.
+        line containing `find` (a string), then inserted after that line.
       * ``insert_before`` — payload is reindented to the line indent of the
-        line containing `find`, then inserted on a new line immediately
-        before that line.
+        line containing `find` (a string), then inserted on a new line
+        immediately before that line.
 
     Idempotent at the file level — if the marker is already present
     anywhere in the file, the edits are skipped wholesale.
@@ -216,6 +232,21 @@ def _patch_file(path: Path, edits: list[tuple[str, str, str]]) -> bool:
         return False
 
     for op, find, payload in edits:
+        if op == 'replace_re':
+            matches = list(find.finditer(text))
+            if len(matches) == 0:
+                raise SystemExit(
+                    f'[error] regex anchor missing in {path}:\n'
+                    f'        pattern: {find.pattern!r}\n'
+                    f'        DECA fork may have drifted; merge by hand or '
+                    f'rebase the fork onto a known revision.')
+            if len(matches) > 1:
+                raise SystemExit(
+                    f'[error] regex anchor not unique in {path}: '
+                    f'{find.pattern!r} matches {len(matches)} times.')
+            text = find.sub(lambda m: payload(m), text, count=1)
+            continue
+
         if find not in text:
             raise SystemExit(
                 f'[error] anchor missing in {path}:\n'
@@ -271,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
 
     any_changed = False
     any_changed |= _patch_file(datasets_py, [
-        ('replace', DATASETS_INIT_OLD, DATASETS_INIT_NEW),
+        ('replace_re', DATASETS_INIT_PATTERN, _datasets_init_replace),
         ('insert_before', DATASETS_INIT_ANCHOR, DATASETS_INIT_PAYLOAD),
         ('insert_before', DATASETS_GETITEM_ANCHOR, DATASETS_GETITEM_PAYLOAD),
     ])
