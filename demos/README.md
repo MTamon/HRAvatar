@@ -48,8 +48,8 @@ whose expressions are transferred to the avatar of the *target* subject.
 
 ```bash
 bash demos/demo_1_train_subject.sh \
-    --subject-root /data/subjects \
-    --subject-name alice \
+    --sbj-root /data/subjects \
+    --sbj-name alice \
     --video /data/raw/alice.mp4 \
     --intrinsics hdtf
 ```
@@ -93,8 +93,8 @@ Follow the project's convention:
 
 ```bash
 bash demos/demo_2_cross_reenactment.sh \
-    --subject-root /data/subjects \
-    --subject-name alice \
+    --sbj-root /data/subjects \
+    --sbj-name alice \
     --video /data/raw/alice.mp4 \
     --intrinsics hdtf \
     --target-model-dir outputs/custom/bob
@@ -140,8 +140,8 @@ will reproduce it.
 ```bash
 # 1) preprocess once (reuse the helper used by demo 1)
 bash demos/_preprocess_subject.sh \
-    --subject-root /data/subjects \
-    --subject-name alice \
+    --sbj-root /data/subjects \
+    --sbj-name alice \
     --video /data/raw/alice.mp4 \
     --intrinsics hdtf
 

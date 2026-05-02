@@ -48,8 +48,8 @@
 
 ```bash
 bash demos/demo_1_train_subject.sh \
-    --subject-root /data/subjects \
-    --subject-name alice \
+    --sbj-root /data/subjects \
+    --sbj-name alice \
     --video /data/raw/alice.mp4 \
     --intrinsics hdtf
 ```
@@ -93,8 +93,8 @@ SMIRK (`net_modules/flame_params_net_smirk.py`) の両方が含まれていま�
 
 ```bash
 bash demos/demo_2_cross_reenactment.sh \
-    --subject-root /data/subjects \
-    --subject-name alice \
+    --sbj-root /data/subjects \
+    --sbj-name alice \
     --video /data/raw/alice.mp4 \
     --intrinsics hdtf \
     --target-model-dir outputs/custom/bob
@@ -138,8 +138,8 @@ HRAvatar でも同じ動きが再現されます。
 ```bash
 # 1) 一度だけ前処理する (demo 1 と同じ helper を再利用)
 bash demos/_preprocess_subject.sh \
-    --subject-root /data/subjects \
-    --subject-name alice \
+    --sbj-root /data/subjects \
+    --sbj-name alice \
     --video /data/raw/alice.mp4 \
     --intrinsics hdtf
 
