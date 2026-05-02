@@ -13,7 +13,7 @@ from typing import NamedTuple
 from glob import glob
 from PIL import Image
 from tqdm import tqdm
-from skimage.transform import warp
+from skimage.transform import warp, SimilarityTransform
 
 
 class Camera_params():
@@ -108,17 +108,40 @@ class TrackedData(torch.utils.data.Dataset):
         self.imagepath_list=imagepath_list
         self.data_len=len(imagepath_list)
         
+        # Per-frame SMIRK input crop. Two paths:
+        #   (1) `stable_bbox.npz` exists at the dataset root → load the
+        #       precomputed (basename → tform) mapping. Skip MediaPipe at
+        #       training time entirely; same crop as DECA preprocessing saw.
+        #   (2) Otherwise → fall back to legacy per-iter MediaPipe + crop_face.
+        # Path (1) eliminates the mouth/blink leak into the SMIRK encoder
+        # input that is the dominant source of expression-channel jitter.
+        self._stable_bbox_tforms: dict[str, np.ndarray] | None = None
         if args.with_param_net_smirk:
-            from mediapipe.tasks import python
-            from mediapipe.tasks.python import vision
-            base_options = python.BaseOptions(model_asset_path='./assets/smirk/face_landmarker.task')
-            options = vision.FaceLandmarkerOptions(base_options=base_options,
-                                                output_face_blendshapes=True,
-                                                output_facial_transformation_matrixes=True,
-                                                num_faces=1,
-                                                min_face_detection_confidence=0.1,
-                                                min_face_presence_confidence=0.1)
-            self.detector = vision.FaceLandmarker.create_from_options(options)
+            stable_bbox_path = os.path.join(path, 'stable_bbox.npz')
+            if os.path.exists(stable_bbox_path):
+                npz = np.load(stable_bbox_path, allow_pickle=False)
+                names = [str(b) for b in npz['frame_basenames']]
+                tforms = npz['tform']
+                self._stable_bbox_tforms = {
+                    name: tforms[i] for i, name in enumerate(names)
+                }
+                print(f'[data_loader] using precomputed stable bbox '
+                      f'({len(self._stable_bbox_tforms)} frames) from '
+                      f'{stable_bbox_path}')
+            else:
+                from mediapipe.tasks import python
+                from mediapipe.tasks.python import vision
+                base_options = python.BaseOptions(model_asset_path='./assets/smirk/face_landmarker.task')
+                options = vision.FaceLandmarkerOptions(base_options=base_options,
+                                                    output_face_blendshapes=True,
+                                                    output_facial_transformation_matrixes=True,
+                                                    num_faces=1,
+                                                    min_face_detection_confidence=0.1,
+                                                    min_face_presence_confidence=0.1)
+                self.detector = vision.FaceLandmarker.create_from_options(options)
+                print('[data_loader] stable_bbox.npz not found — falling back '
+                      'to per-iteration MediaPipe + crop_face. Run '
+                      'preprocess/stable_bbox.py to remove SMIRK input jitter.')
 
         # assume same resolution for all images
         image = Image.open(imagepath_list[0])
@@ -222,14 +245,26 @@ class TrackedData(torch.utils.data.Dataset):
         warped_image=None
         crop_size=[224,224]
         if args.with_param_net_smirk:
-            kpt_mediapipe = run_mediapipe((image*255.0).astype(np.uint8),self.detector)
-            if (kpt_mediapipe is None):
-                print('Could not find landmarks for the image using last landmark.')
-                kpt_mediapipe=landmark
+            if self._stable_bbox_tforms is not None:
+                # Precomputed path: look up the stabilized similarity transform
+                # by source-image basename and warp directly. No MediaPipe at
+                # training time — same (center, size) DECA preprocessing saw.
+                tform_params = self._stable_bbox_tforms.get(image_basename)
+                if tform_params is None:
+                    raise KeyError(
+                        f'stable_bbox.npz has no entry for {image_basename}; '
+                        f'regenerate it with preprocess/stable_bbox.py after '
+                        f'changing image/.')
+                tform = SimilarityTransform(matrix=tform_params)
             else:
-                kpt_mediapipe = kpt_mediapipe[..., :2]
-                landmark=kpt_mediapipe
-            tform = crop_face(image,kpt_mediapipe,scale=1.4,image_size=224)
+                kpt_mediapipe = run_mediapipe((image*255.0).astype(np.uint8),self.detector)
+                if (kpt_mediapipe is None):
+                    print('Could not find landmarks for the image using last landmark.')
+                    kpt_mediapipe=landmark
+                else:
+                    kpt_mediapipe = kpt_mediapipe[..., :2]
+                    landmark=kpt_mediapipe
+                tform = crop_face(image,kpt_mediapipe,scale=1.4,image_size=224)
             warped_image = warp(image, tform.inverse, output_shape=(224, 224), preserve_range=True)
             warped_image=torch.tensor(warped_image, device=self.device,dtype=torch.float32)
             warped_image=warped_image.permute(2, 0, 1)[None]
