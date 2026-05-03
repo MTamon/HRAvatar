@@ -24,6 +24,8 @@
 #   --epochs N           training epochs (default 15)
 #   --with-albedo        run IntrinsicAnything for albedo pseudo-GT
 #   --skip-preprocess    skip preprocessing (already done)
+#   --bbox-verify        also write bbox_verify.mp4 + .csv (default off)
+#   --no-stable-bbox     skip the stable bbox preprocess step (default on)
 #
 # Environment overrides still accepted for backward compatibility:
 #   CUDA_VISIBLE_DEVICES  (default 0)
@@ -32,6 +34,8 @@
 #   EPOCHS                training epochs (default 15)
 #   WITH_ALBEDO=1         run IntrinsicAnything for albedo pseudo-GT
 #   SKIP_PREPROCESS=1     skip preprocessing (already done)
+#   BBOX_VERIFY=1         also write bbox_verify.mp4 + .csv (default off)
+#   NO_STABLE_BBOX=1       skip the stable bbox preprocess step (default on)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -46,12 +50,14 @@ INTRINSICS=""
 : "${CUDA_VISIBLE_DEVICES:=0}"
 : "${EPOCHS:=15}"
 : "${SKIP_PREPROCESS:=0}"
+: "${NO_STABLE_BBOX:=1}"
 # Forwarded to _preprocess_subject.sh as flags (the env-var interface there
 # was retired to avoid residual / typo risk; we still accept the env-var
 # inputs here for backward compatibility with existing automation).
 : "${FPS:=30}"
 : "${RESIZE:=512}"
 : "${WITH_ALBEDO:=0}"
+: "${BBOX_VERIFY:=0}"
 export CUDA_VISIBLE_DEVICES
 
 POSITIONAL=()
@@ -75,6 +81,8 @@ while [[ $# -gt 0 ]]; do
     --epochs)          require_value "$@"; EPOCHS="$2"; shift 2 ;;
     --with-albedo|--with_albedo) WITH_ALBEDO=1; shift ;;
     --skip-preprocess) SKIP_PREPROCESS=1; shift ;;
+    --bbox-verify)     BBOX_VERIFY=1; shift ;;
+    --no-stable-bbox)  NO_STABLE_BBOX=1; shift ;;
     -h|--help)         usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -109,6 +117,12 @@ if [[ "${SKIP_PREPROCESS}" != "1" ]]; then
   PREPROCESS_FLAGS=(--fps "${FPS}" --resize "${RESIZE}")
   if [[ "${WITH_ALBEDO}" == "1" ]]; then
     PREPROCESS_FLAGS+=(--with-albedo)
+  fi
+  if [[ "${BBOX_VERIFY}" == "1" ]]; then
+    PREPROCESS_FLAGS+=(--bbox-verify)
+  fi
+  if [[ "${NO_STABLE_BBOX}" == "1" ]]; then
+    PREPROCESS_FLAGS+=(--no-stable-bbox)
   fi
   bash demos/_preprocess_subject.sh \
       --sbj-root "${ROOT}" \
