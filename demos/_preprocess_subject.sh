@@ -150,16 +150,6 @@ if [[ ! -f "${DATA_DIR}/${NAME}.mp4" ]]; then
   ln -sf "$(realpath "${VIDEO}")" "${DATA_DIR}/${NAME}.mp4"
 fi
 
-# Auto-apply idempotent DECA patches (stable_bbox + optimize regularizer).
-# Both patchers print [skip] if the marker is already present, so re-running
-# is cheap and safe. Pass --skip-deca-patches to bypass entirely (e.g. when
-# the operator maintains a hand-merged DECA fork).
-if [[ "${SKIP_DECA_PATCHES}" != "1" && -d "${DECA_DIR}/decalib" ]]; then
-  echo "[preprocess 0/5] DECA patches (idempotent)"
-  python "${REPO_ROOT}/tools/patches/apply_deca_stable_bbox.py" "${DECA_DIR}"
-  python "${REPO_ROOT}/tools/patches/apply_deca_optimize_regularizer.py" "${DECA_DIR}"
-fi
-
 echo "[preprocess 1/5] crop + matting"
 python preprocess/crop_and_matting.py \
     --source "${ROOT}" --name "${NAME}" --fps "${FPS}" \
