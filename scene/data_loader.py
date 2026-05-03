@@ -9,6 +9,7 @@ from copy import deepcopy
 from natsort import natsorted
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix,fov2focal,focal2fov
 from utils.general_utils import run_mediapipe, crop_face
+from utils.onefilter import smooth_sequence
 from typing import NamedTuple
 from glob import glob
 from PIL import Image
@@ -146,9 +147,18 @@ class TrackedData(torch.utils.data.Dataset):
         # assume same resolution for all images
         image = Image.open(imagepath_list[0])
         self.imagew, self.imageh = image.size[0], image.size[1]
-        
+
         self.bg = torch.tensor([1, 1, 1], dtype=torch.float32, device=self.device) if args.white_background else torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
         shapecode = torch.tensor(tracked_params_dict["shapecode"], device=self.device)[:, :args.n_shape]
+
+        # Optional One-Euro temporal smoothing of per-frame tracker params.
+        # Inspired by MTamon/Gaussian-HS. Off by default; enabled when
+        # `--jitter_filter` is set. The smoothed values replace the raw
+        # per-frame entries below.
+        self._smoothed: dict[str, dict[str, np.ndarray]] = {}
+        if getattr(args, "jitter_filter", False):
+            self._smoothed = self._build_smoothed_params(
+                tracked_params_dict, imagepath_list, args)
         self.cam_params_list=[]
         for idx, imagepath in tqdm(enumerate(imagepath_list)):
             imagename = imagepath.split('/')[-1].split('.')[0]
@@ -162,21 +172,33 @@ class TrackedData(torch.utils.data.Dataset):
             
             
             if "translation" in tracked_params_dict[imagekey].keys():
-                translation_code = torch.tensor(tracked_params_dict[imagekey]["translation"], dtype=torch.float32, device=self.device)
+                translation_code = self._maybe_smoothed(
+                    "translation", imagekey,
+                    tracked_params_dict[imagekey]["translation"])
+                translation_code = torch.tensor(translation_code, dtype=torch.float32, device=self.device)
             else:
                 translation_code = None
             if "eyelids" in tracked_params_dict[imagekey].keys():
-                eyelid_code = torch.tensor(tracked_params_dict[imagekey]["eyelids"], dtype=torch.float32, device=self.device)
+                eyelid_code = self._maybe_smoothed(
+                    "eyelid", imagekey,
+                    tracked_params_dict[imagekey]["eyelids"])
+                eyelid_code = torch.tensor(eyelid_code, dtype=torch.float32, device=self.device)
             else:
                 eyelid_code = None
-                
+
             if  "intrinsics"in tracked_params_dict.keys():
                 intrinsics=tracked_params_dict["intrinsics"]#[fx, fy, cx, cy]
                 fovx=2*np.arctan2(intrinsics[2],intrinsics[0])
-            
-            
-            fullposecode = torch.tensor(tracked_params_dict[imagekey]["fullposecode"], dtype=torch.float32, device=self.device)
-            expcode = torch.tensor(tracked_params_dict[imagekey]["expcode"], dtype=torch.float32, device=self.device)[:, :args.n_expr]
+
+
+            fullposecode = self._maybe_smoothed(
+                "fullpose", imagekey,
+                tracked_params_dict[imagekey]["fullposecode"])
+            fullposecode = torch.tensor(fullposecode, dtype=torch.float32, device=self.device)
+            expcode = self._maybe_smoothed(
+                "expression", imagekey,
+                tracked_params_dict[imagekey]["expcode"])
+            expcode = torch.tensor(expcode, dtype=torch.float32, device=self.device)[:, :args.n_expr]
             
             fovy = focal2fov(fov2focal(fovx, self.imagew), self.imageh)
             world_view_transform,projection_matrix,full_proj_transform,camera_center,extrinsic_matrix,intrinsic_matrix,R,T = \
@@ -281,11 +303,13 @@ class TrackedData(torch.utils.data.Dataset):
         return image,mask_data,albedo,specular,warped_image
     
     def _load_camera(self,tracked_params_dict,imagekey,fovx,fovy,zfar=100.0,znear =0.01):
-        
+
+        world_mat_raw = self._maybe_smoothed(
+            "world_mat", imagekey, tracked_params_dict[imagekey]["world_mat"])
         w2c=np.array([[1 ,0 ,0 ,0 ],
                     [0 ,-1,0 ,0 ],
                     [0 ,0 ,-1,0 ],
-                    [0 ,0 ,0 ,1 ]],dtype=np.float32)@np.array(tracked_params_dict[imagekey]["world_mat"],dtype=np.float32)
+                    [0 ,0 ,0 ,1 ]],dtype=np.float32)@np.array(world_mat_raw,dtype=np.float32)
         R=np.transpose(w2c[:3,:3])
         T=w2c[:3, 3]
         fo=fov2focal(fovx, self.imagew)
@@ -304,5 +328,95 @@ class TrackedData(torch.utils.data.Dataset):
         R=torch.tensor(R,dtype=torch.float32,device=self.device)
         T=torch.tensor(T,dtype=torch.float32,device=self.device)
         return world_view_transform,projection_matrix,full_proj_transform,camera_center,extrinsic_matrix,intrinsic_matrix,R,T
-    
-    
+
+    # ---- One-Euro tracker smoothing (opt-in via --jitter_filter) -----------
+
+    @staticmethod
+    def _resolve_imagekey(imagepath, tracked_params_dict):
+        imagename = imagepath.split('/')[-1].split('.')[0]
+        image_basename = os.path.basename(imagepath)
+        return imagename if imagename in tracked_params_dict else image_basename
+
+    def _build_smoothed_params(self, tracked_params_dict, imagepath_list, args):
+        """Pre-compute zero-phase One-Euro smoothed series per channel.
+
+        Returns ``{channel: {imagekey: np.ndarray}}``. Channels not requested
+        in ``args.jitter_filter_targets`` are not populated.
+        """
+        targets = set(getattr(args, "jitter_filter_targets",
+                              ["translation", "fullpose", "expression", "eyelid"]))
+        fps = float(getattr(args, "jitter_filter_fps", 30.0))
+        min_cutoff = float(getattr(args, "jitter_filter_min_cutoff", 1.0))
+        beta = float(getattr(args, "jitter_filter_beta", 0.0))
+        d_cutoff = float(getattr(args, "jitter_filter_d_cutoff", 1.0))
+
+        # (key in tracked_params_dict[imagekey], target_name)
+        channel_specs = [
+            ("translation", "translation"),
+            ("fullposecode", "fullpose"),
+            ("expcode", "expression"),
+            ("eyelids", "eyelid"),
+            ("world_mat", "world_mat"),
+        ]
+
+        smoothed: dict[str, dict[str, np.ndarray]] = {}
+        keys_in_order: list[str] = [
+            self._resolve_imagekey(p, tracked_params_dict) for p in imagepath_list
+        ]
+
+        n_smoothed = 0
+        for src_key, target_name in channel_specs:
+            if target_name not in targets:
+                continue
+            sample = tracked_params_dict.get(keys_in_order[0], {})
+            if src_key not in sample:
+                continue
+            try:
+                seq = np.asarray(
+                    [tracked_params_dict[k][src_key] for k in keys_in_order],
+                    dtype=np.float64,
+                )
+            except (KeyError, ValueError) as exc:
+                print(f"[data_loader] jitter_filter: cannot stack '{src_key}' "
+                      f"({exc}); skipping this channel.")
+                continue
+            if seq.shape[0] < 2:
+                continue
+            smoothed_seq = smooth_sequence(
+                seq, fps=fps, min_cutoff=min_cutoff, beta=beta,
+                d_cutoff=d_cutoff, bidirectional=True,
+            )
+            smoothed[target_name] = {
+                k: smoothed_seq[i] for i, k in enumerate(keys_in_order)
+            }
+            n_smoothed += 1
+
+        if n_smoothed:
+            print(f"[data_loader] jitter_filter: smoothed {n_smoothed} channel(s) "
+                  f"({sorted(smoothed.keys())}) "
+                  f"with min_cutoff={min_cutoff} Hz, beta={beta}, fps={fps}")
+        else:
+            print("[data_loader] jitter_filter: enabled but no channels matched; "
+                  "verify --jitter_filter_targets and tracked_params.json contents.")
+        return smoothed
+
+    def _maybe_smoothed(self, target_name, imagekey, raw_value):
+        """Return smoothed array if available, else the raw value unchanged."""
+        if not self._smoothed:
+            return raw_value
+        per_key = self._smoothed.get(target_name)
+        if per_key is None:
+            return raw_value
+        out = per_key.get(imagekey)
+        if out is None:
+            return raw_value
+        # Preserve original shape (e.g. (1, D) for fullpose / exp / translation,
+        # (D,) for eyelids, (3, 4) for world_mat).
+        raw_arr = np.asarray(raw_value)
+        if out.shape != raw_arr.shape:
+            try:
+                out = out.reshape(raw_arr.shape)
+            except ValueError:
+                return raw_value
+        return out
+

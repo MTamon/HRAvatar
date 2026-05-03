@@ -37,9 +37,15 @@ class GaussianHeadModel(GaussianModel):
         
         self.color_precomp=args.color_precomp
         self.with_param_net_smirk=args.with_param_net_smirk
-        
+
         if self.with_param_net_smirk:
             self.flame_params_net=FlameParamsNetSmirk(**args.flame_params_net_params).to(self.device)
+
+        # Optional causal One-Euro smoother for SMIRK encoder outputs.
+        # Off by default. set_smirk_smoother() (called from render.py when
+        # --jitter_filter --jitter_filter_smirk is given) installs a buffer
+        # that smooths expression / jaw / eyelid in temporal order.
+        self._smirk_smoother = None
             
         self.with_depth_supervise=args.with_depth_supervise
         self.warm_up_iter=args.warm_up_iter
@@ -318,6 +324,39 @@ class GaussianHeadModel(GaussianModel):
 
     
     
+    def set_smirk_smoother(self, smoother):
+        """Install / clear a CausalOneEuroBuffer for SMIRK output smoothing.
+
+        Pass ``None`` to disable. Reset the buffer between independent render
+        sequences (e.g. train split, test split, multi-view trajectory) by
+        calling ``smoother.reset()`` before re-attaching.
+        """
+        self._smirk_smoother = smoother
+
+    def _smooth_smirk_outputs(self, expression_param, jaw_params, eyelid_param):
+        """Apply the installed One-Euro buffer to SMIRK encoder outputs.
+
+        Operates on the first (B==1) sample. For B > 1 the smoother is
+        applied per-sample in order; this matches the renderer's per-frame
+        loop. Returns tensors on the original device/dtype.
+        """
+        smoother = self._smirk_smoother
+        if smoother is None:
+            return expression_param, jaw_params, eyelid_param
+
+        def _apply(name, t):
+            if t is None:
+                return None
+            arr = t.detach().cpu().numpy()
+            out = smoother.filter(name, arr)
+            return torch.as_tensor(out, dtype=t.dtype, device=t.device)
+
+        return (
+            _apply("expression", expression_param),
+            _apply("jaw", jaw_params),
+            _apply("eyelid", eyelid_param),
+        )
+
     def forward(self,shape_param,expression_param,full_pose_param,camera_center,eyelid_param=None,translation_param=None,warped_image=None,iteration=torch.inf):
         
         if self.shape_param is not None:
@@ -330,6 +369,13 @@ class GaussianHeadModel(GaussianModel):
             expression_param = out_params['expression_params']
             jaw_params = out_params.get('jaw_params', None)
             eyelid_param = out_params.get('eyelid_params', None)
+            # Optional render-time smoothing of SMIRK outputs (per-sequence
+            # causal One-Euro). Active only when render.py installed a
+            # smoother. Training code path leaves _smirk_smoother=None so the
+            # gradient flow through the encoder is unchanged.
+            if self._smirk_smoother is not None:
+                expression_param, jaw_params, eyelid_param = self._smooth_smirk_outputs(
+                    expression_param, jaw_params, eyelid_param)
             #[(global)3, neck (0)3, (jaw)3, eyepose (0)6]
             #use_smirk_jaw_pose
             self.d_jaw_params=(full_pose_param[:,6:9]-jaw_params)

@@ -29,6 +29,16 @@
 #   --fps N                  frame-rate for frame extraction (default 30)
 #   --resize N               square crop size (default 512)
 #   --skip-preprocess        skip re-running the preprocessing pipeline
+#   --lambda-shape F         DECA optimize.py shape regularizer weight
+#                            (forwarded to _preprocess_subject.sh; only used
+#                            when SKIP_PREPROCESS=0). Default 1e-2.
+#   --lambda-exp F           DECA optimize.py exp regularizer weight (default 1e-2)
+#   --skip-deca-patches      do NOT auto-apply tools/patches/apply_deca_*.py
+#   --jitter-filter          enable One-Euro smoothing of source tracker
+#                            params at render time. Default OFF.
+#   --jitter-filter-smirk    also smooth SMIRK encoder outputs (causal).
+#   --jitter-filter-min-cutoff F   default 1.0 Hz
+#   --jitter-filter-beta F         default 0.0
 #
 # Environment overrides still accepted for backward compatibility:
 #   CUDA_VISIBLE_DEVICES  (default 0)
@@ -55,7 +65,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,44p' "$0"
+  sed -n '2,46p' "$0"
 }
 
 ROOT=""
@@ -67,6 +77,13 @@ TGT=""
 : "${FPS:=30}"
 : "${RESIZE:=512}"
 : "${SKIP_PREPROCESS:=0}"
+: "${LAMBDA_SHAPE:=}"
+: "${LAMBDA_EXP:=}"
+: "${SKIP_DECA_PATCHES:=0}"
+: "${JITTER_FILTER:=0}"
+: "${JITTER_FILTER_SMIRK:=0}"
+: "${JITTER_FILTER_MIN_CUTOFF:=}"
+: "${JITTER_FILTER_BETA:=}"
 
 export CUDA_VISIBLE_DEVICES
 
@@ -90,6 +107,13 @@ while [[ $# -gt 0 ]]; do
     --fps)              require_value "$@"; FPS="$2"; shift 2 ;;
     --resize)           require_value "$@"; RESIZE="$2"; shift 2 ;;
     --skip-preprocess)  SKIP_PREPROCESS=1; shift ;;
+    --lambda-shape)     require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
+    --lambda-exp)       require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
+    --jitter-filter)            JITTER_FILTER=1; shift ;;
+    --jitter-filter-smirk)      JITTER_FILTER=1; JITTER_FILTER_SMIRK=1; shift ;;
+    --jitter-filter-min-cutoff) require_value "$@"; JITTER_FILTER_MIN_CUTOFF="$2"; shift 2 ;;
+    --jitter-filter-beta)       require_value "$@"; JITTER_FILTER_BETA="$2"; shift 2 ;;
     -h|--help)          usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -127,12 +151,22 @@ if [[ "${SKIP_PREPROCESS}" != "1" && ! -f "${TRACKED_PARAMS}" && ! -f "${TRACKED
     echo "No video found at ${VIDEO}; provide a source video or use SKIP_PREPROCESS=1 with tracked params in ${DATA_DIR}."
     exit 2
   fi
+  PREPROCESS_FLAGS=(--fps "${FPS}" --resize "${RESIZE}")
+  if [[ -n "${LAMBDA_SHAPE}" ]]; then
+    PREPROCESS_FLAGS+=(--lambda-shape "${LAMBDA_SHAPE}")
+  fi
+  if [[ -n "${LAMBDA_EXP}" ]]; then
+    PREPROCESS_FLAGS+=(--lambda-exp "${LAMBDA_EXP}")
+  fi
+  if [[ "${SKIP_DECA_PATCHES}" == "1" ]]; then
+    PREPROCESS_FLAGS+=(--skip-deca-patches)
+  fi
   bash demos/_preprocess_subject.sh \
       --sbj-root "${ROOT}" \
       --sbj-name "${NAME}" \
       --video "${VIDEO}" \
       --intrinsics "${INTRINSICS}" \
-      --fps "${FPS}" --resize "${RESIZE}"
+      "${PREPROCESS_FLAGS[@]}"
 elif [[ ! -f "${TRACKED_PARAMS}" ]]; then
   if [[ -f "${TRACKED_PARAMS_V2}" ]]; then
     echo "[preprocess] skipping; found ${TRACKED_PARAMS_V2}"
@@ -144,10 +178,25 @@ else
   echo "[preprocess] skipping; found ${TRACKED_PARAMS}"
 fi
 
+RENDER_EXTRA_ARGS=()
+if [[ "${JITTER_FILTER}" == "1" ]]; then
+  RENDER_EXTRA_ARGS+=(--jitter_filter --jitter_filter_fps "${FPS}")
+  if [[ "${JITTER_FILTER_SMIRK}" == "1" ]]; then
+    RENDER_EXTRA_ARGS+=(--jitter_filter_smirk)
+  fi
+  if [[ -n "${JITTER_FILTER_MIN_CUTOFF}" ]]; then
+    RENDER_EXTRA_ARGS+=(--jitter_filter_min_cutoff "${JITTER_FILTER_MIN_CUTOFF}")
+  fi
+  if [[ -n "${JITTER_FILTER_BETA}" ]]; then
+    RENDER_EXTRA_ARGS+=(--jitter_filter_beta "${JITTER_FILTER_BETA}")
+  fi
+fi
+
 python render.py \
     --model_path "${TGT}" \
     --skip_train --skip_test \
-    --corss_source_paths "${DATA_DIR}"
+    --corss_source_paths "${DATA_DIR}" \
+    ${RENDER_EXTRA_ARGS[@]+"${RENDER_EXTRA_ARGS[@]}"}
 
 echo
 echo "Done. Renders in ${TGT}/test_cross_reenactment/"

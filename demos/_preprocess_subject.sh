@@ -35,6 +35,12 @@ Optional flags:
   --no-stable-bbox       skip the stable bbox preprocess step  (default on)
   --bbox-verify          also write bbox_verify.mp4 + .csv     (default off)
   --bbox-cutoff-hz F     FIR LPF cutoff in Hz for bbox.size    (default 2.5)
+  --lambda-shape F       DECA optimize.py shape regularizer    (default 1e-2,
+                         the original HRAvatar fork value. Pass 1.0-5.0 to
+                         fix alien-looking enlarged head / collapsed face in
+                         optimize_vis.jpg. Requires DECA optimize patcher.)
+  --lambda-exp F         DECA optimize.py exp regularizer      (default 1e-2)
+  --skip-deca-patches    do NOT auto-apply tools/patches/apply_deca_*.py     (default off)
   -h, --help             print this message and exit
 
 Honored environment variable:
@@ -47,6 +53,12 @@ Stable bbox notes:
   `tools/patches/apply_deca_stable_bbox.py`) and `scene/data_loader.py`
   auto-detects it at training time so SMIRK encoder input no longer
   wobbles with mouth/blink. See `doc/stable_bbox.md`.
+
+DECA patches:
+  By default this script auto-runs the idempotent patchers under
+  `tools/patches/` so DECA can accept `--precomputed-bbox`,
+  `--lambda_shape`, `--lambda_exp`. Pass `--skip-deca-patches` to skip
+  (e.g. when you maintain a pre-patched DECA fork manually).
 EOF
 }
 
@@ -62,6 +74,9 @@ WITH_ALBEDO=0
 STABLE_BBOX=1
 BBOX_VERIFY=0
 BBOX_CUTOFF_HZ=2.5
+LAMBDA_SHAPE=""
+LAMBDA_EXP=""
+SKIP_DECA_PATCHES=0
 
 POSITIONAL=()
 
@@ -85,6 +100,9 @@ while [[ $# -gt 0 ]]; do
     --no-stable-bbox)  STABLE_BBOX=0; shift ;;
     --bbox-verify)     BBOX_VERIFY=1; shift ;;
     --bbox-cutoff-hz)  require_value "$@"; BBOX_CUTOFF_HZ="$2"; shift 2 ;;
+    --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
+    --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
     -h|--help)         usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -132,6 +150,16 @@ if [[ ! -f "${DATA_DIR}/${NAME}.mp4" ]]; then
   ln -sf "$(realpath "${VIDEO}")" "${DATA_DIR}/${NAME}.mp4"
 fi
 
+# Auto-apply idempotent DECA patches (stable_bbox + optimize regularizer).
+# Both patchers print [skip] if the marker is already present, so re-running
+# is cheap and safe. Pass --skip-deca-patches to bypass entirely (e.g. when
+# the operator maintains a hand-merged DECA fork).
+if [[ "${SKIP_DECA_PATCHES}" != "1" && -d "${DECA_DIR}/decalib" ]]; then
+  echo "[preprocess 0/5] DECA patches (idempotent)"
+  python "${REPO_ROOT}/tools/patches/apply_deca_stable_bbox.py" "${DECA_DIR}"
+  python "${REPO_ROOT}/tools/patches/apply_deca_optimize_regularizer.py" "${DECA_DIR}"
+fi
+
 echo "[preprocess 1/5] crop + matting"
 python preprocess/crop_and_matting.py \
     --source "${ROOT}" --name "${NAME}" --fps "${FPS}" \
@@ -174,10 +202,18 @@ echo "[preprocess 4/5] iris segmentation"
 python preprocess/iris.py --path "${DATA_DIR}"
 
 echo "[preprocess 5/5] optimize FLAME parameters"
+DECA_OPTIMIZE_EXTRA_ARGS=()
+if [[ -n "${LAMBDA_SHAPE}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--lambda_shape "${LAMBDA_SHAPE}")
+fi
+if [[ -n "${LAMBDA_EXP}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--lambda_exp "${LAMBDA_EXP}")
+fi
 ( cd "${DECA_DIR}" && \
   python optimize.py --path "${DATA_DIR}" \
       --cx "${CX}" --cy "${CY}" --fx "${FX}" --fy "${FY}" --size "${RESIZE}" \
-      --n_shape 100 --n_expr 100 --with_translation )
+      --n_shape 100 --n_expr 100 --with_translation \
+      ${DECA_OPTIMIZE_EXTRA_ARGS[@]+"${DECA_OPTIMIZE_EXTRA_ARGS[@]}"} )
 
 if [[ "${WITH_ALBEDO}" == "1" ]]; then
   echo "[preprocess opt] IntrinsicAnything pseudo-albedo"
