@@ -40,6 +40,10 @@ Optional flags:
                          fix alien-looking enlarged head / collapsed face in
                          optimize_vis.jpg. Requires DECA optimize patcher.)
   --lambda-exp F         DECA optimize.py exp regularizer      (default 1e-2)
+  --lambda-pose-anchor F  Pose-anchor regularizer in DECA optimize.py
+                         (default 0.0 = off). Useful when --lambda-shape is
+                         high and the fitted face starts over-rotating to
+                         compensate (try 0.05-0.5). See doc/deca_patches.md.
   --skip-deca-patches    do NOT auto-apply tools/patches/apply_deca_*.py     (default off)
   -h, --help             print this message and exit
 
@@ -76,6 +80,7 @@ BBOX_VERIFY=0
 BBOX_CUTOFF_HZ=2.5
 LAMBDA_SHAPE=""
 LAMBDA_EXP=""
+LAMBDA_POSE_ANCHOR=""
 SKIP_DECA_PATCHES=0
 
 POSITIONAL=()
@@ -102,6 +107,7 @@ while [[ $# -gt 0 ]]; do
     --bbox-cutoff-hz)  require_value "$@"; BBOX_CUTOFF_HZ="$2"; shift 2 ;;
     --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
     --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --lambda-pose-anchor) require_value "$@"; LAMBDA_POSE_ANCHOR="$2"; shift 2 ;;
     --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
     -h|--help)         usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
@@ -158,6 +164,7 @@ if [[ "${SKIP_DECA_PATCHES}" != "1" && -d "${DECA_DIR}/decalib" ]]; then
   echo "[preprocess 0/5] DECA patches (idempotent)"
   python "${REPO_ROOT}/tools/patches/apply_deca_stable_bbox.py" "${DECA_DIR}"
   python "${REPO_ROOT}/tools/patches/apply_deca_optimize_regularizer.py" "${DECA_DIR}"
+  python "${REPO_ROOT}/tools/patches/apply_deca_pose_anchor.py" "${DECA_DIR}"
 fi
 
 echo "[preprocess 1/5] crop + matting"
@@ -208,6 +215,9 @@ if [[ -n "${LAMBDA_SHAPE}" ]]; then
 fi
 if [[ -n "${LAMBDA_EXP}" ]]; then
   DECA_OPTIMIZE_EXTRA_ARGS+=(--lambda_exp "${LAMBDA_EXP}")
+fi
+if [[ -n "${LAMBDA_POSE_ANCHOR}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--lambda_pose_anchor "${LAMBDA_POSE_ANCHOR}")
 fi
 ( cd "${DECA_DIR}" && \
   python optimize.py --path "${DATA_DIR}" \

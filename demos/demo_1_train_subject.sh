@@ -31,6 +31,11 @@
 #                        if optimize_vis.jpg shows alien-looking enlarged
 #                        head / collapsed face. See doc/deca_patches.md.
 #   --lambda-exp F       DECA optimize.py expression regularizer (default 1e-2)
+#   --lambda-pose-anchor F
+#                        Pose-anchor regularizer in DECA optimize.py
+#                        (default 0.0 = off). Set to 0.05-0.5 when
+#                        --lambda-shape is high to prevent the fitted face
+#                        from over-rotating.
 #   --skip-deca-patches  do NOT auto-apply tools/patches/apply_deca_*.py (default off)
 #   --jitter-filter      enable One-Euro temporal smoothing of tracker params
 #                        at train+render time. Default OFF. See
@@ -75,6 +80,7 @@ INTRINSICS=""
 : "${BBOX_VERIFY:=0}"
 : "${LAMBDA_SHAPE:=}"
 : "${LAMBDA_EXP:=}"
+: "${LAMBDA_POSE_ANCHOR:=}"
 : "${SKIP_DECA_PATCHES:=0}"
 # Jitter-filter pass-through to train.py / render.py (off by default).
 : "${JITTER_FILTER:=0}"
@@ -108,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --no-stable-bbox)  NO_STABLE_BBOX=1; shift ;;
     --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
     --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --lambda-pose-anchor) require_value "$@"; LAMBDA_POSE_ANCHOR="$2"; shift 2 ;;
     --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
     --jitter-filter)            JITTER_FILTER=1; shift ;;
     --jitter-filter-smirk)      JITTER_FILTER=1; JITTER_FILTER_SMIRK=1; shift ;;
@@ -159,6 +166,9 @@ if [[ "${SKIP_PREPROCESS}" != "1" ]]; then
   fi
   if [[ -n "${LAMBDA_EXP}" ]]; then
     PREPROCESS_FLAGS+=(--lambda-exp "${LAMBDA_EXP}")
+  fi
+  if [[ -n "${LAMBDA_POSE_ANCHOR}" ]]; then
+    PREPROCESS_FLAGS+=(--lambda-pose-anchor "${LAMBDA_POSE_ANCHOR}")
   fi
   if [[ "${SKIP_DECA_PATCHES}" == "1" ]]; then
     PREPROCESS_FLAGS+=(--skip-deca-patches)

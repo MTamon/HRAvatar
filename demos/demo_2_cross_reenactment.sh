@@ -33,6 +33,9 @@
 #                            (forwarded to _preprocess_subject.sh; only used
 #                            when SKIP_PREPROCESS=0). Default 1e-2.
 #   --lambda-exp F           DECA optimize.py exp regularizer weight (default 1e-2)
+#   --lambda-pose-anchor F   pose-anchor regularizer in DECA optimize.py
+#                            (default 0.0 = off; try 0.05-0.5 with high
+#                            --lambda-shape).
 #   --skip-deca-patches      do NOT auto-apply tools/patches/apply_deca_*.py
 #   --jitter-filter          enable One-Euro smoothing of source tracker
 #                            params at render time. Default OFF.
@@ -65,7 +68,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,46p' "$0"
+  sed -n '2,49p' "$0"
 }
 
 ROOT=""
@@ -79,6 +82,7 @@ TGT=""
 : "${SKIP_PREPROCESS:=0}"
 : "${LAMBDA_SHAPE:=}"
 : "${LAMBDA_EXP:=}"
+: "${LAMBDA_POSE_ANCHOR:=}"
 : "${SKIP_DECA_PATCHES:=0}"
 : "${JITTER_FILTER:=0}"
 : "${JITTER_FILTER_SMIRK:=0}"
@@ -109,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     --skip-preprocess)  SKIP_PREPROCESS=1; shift ;;
     --lambda-shape)     require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
     --lambda-exp)       require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --lambda-pose-anchor) require_value "$@"; LAMBDA_POSE_ANCHOR="$2"; shift 2 ;;
     --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
     --jitter-filter)            JITTER_FILTER=1; shift ;;
     --jitter-filter-smirk)      JITTER_FILTER=1; JITTER_FILTER_SMIRK=1; shift ;;
@@ -157,6 +162,9 @@ if [[ "${SKIP_PREPROCESS}" != "1" && ! -f "${TRACKED_PARAMS}" && ! -f "${TRACKED
   fi
   if [[ -n "${LAMBDA_EXP}" ]]; then
     PREPROCESS_FLAGS+=(--lambda-exp "${LAMBDA_EXP}")
+  fi
+  if [[ -n "${LAMBDA_POSE_ANCHOR}" ]]; then
+    PREPROCESS_FLAGS+=(--lambda-pose-anchor "${LAMBDA_POSE_ANCHOR}")
   fi
   if [[ "${SKIP_DECA_PATCHES}" == "1" ]]; then
     PREPROCESS_FLAGS+=(--skip-deca-patches)

@@ -7,6 +7,12 @@ HRAvatar の preprocess パイプラインは `MTamon/DECA@cuda128-HRAvatare` �
 
 ## パッチ一覧
 
+| パッチ | 役割 | マーカ |
+|---|---|---|
+| `apply_deca_stable_bbox.py` | DECA に `--precomputed-bbox` を追加 | `# HRAVATAR_STABLE_BBOX` |
+| `apply_deca_optimize_regularizer.py` | shape / exp 正則化重みの CLI 化 | `# HRAVATAR_OPTIMIZE_REGULARIZER` |
+| `apply_deca_pose_anchor.py` | per-frame pose を DECA 初期値にアンカー | `# HRAVATAR_POSE_ANCHOR` |
+
 ### 1. `apply_deca_stable_bbox.py`
 
 `decalib/datasets/datasets.py` と `demos/demo_reconstruct.py` を改変し、
@@ -62,6 +68,48 @@ total_loss = landmark_loss2 + torch.mean(torch.square(shape)) * args.lambda_shap
 
 `exp` の方は通常デフォルトで問題ありません。
 
+### 3. `apply_deca_pose_anchor.py`（新規）
+
+DECA フォークの `optimize.py` に **pose anchor 正則化** を追加します。
+
+```python
+# 追加される項
+total_loss += torch.mean(torch.square(pose - pose_init)) * args.lambda_pose_anchor
+```
+
+`pose_init` は `pose = nn.Parameter(pose)` 直後にスナップショットを取った
+**DECA per-frame 推定値**（`code.json` の `pose` フィールド由来）です。
+
+新しい CLI フラグ:
+
+| フラグ | 既定 | 意味 |
+|---|---|---|
+| `--lambda_pose_anchor` | `0.0` | pose を DECA 初期値に引き戻す重み。**既定 0 = 無効**（後方互換）。 |
+
+#### なぜ必要か（顔向きの過剰回転問題）
+
+`--lambda_shape` を強くすると、optimizer は landmark 誤差を埋めるために
+**rigid transform**（pose / translation）を過剰に動かしてつじつまを合わせる
+傾向に流れます。特に **global rotation が映像本来の向きより大きく振れる**
+症状が出ます。これは shape の自由度を奪った副作用です。
+
+`--lambda_pose_anchor` で per-frame pose を **DECA の per-frame 推定値**
+（DECA 単体では信頼できる出発点）に弱く引き戻すことで、shape を強く制約
+しつつ pose の過剰補償を抑えられます。
+
+#### 推奨値
+
+| `--lambda_shape` | `--lambda_pose_anchor` | 効果 |
+|---|---|---|
+| `1e-2`（既定） | `0.0`（既定） | 完全にオリジナル挙動 |
+| `0.5` 〜 `1.0` | `0.05` 〜 `0.1` | shape を軽く絞り、pose 過剰回転を弱く抑える |
+| `3.0` 〜 `5.0` | `0.2` 〜 `0.5` | shape を強く絞り、pose もしっかり anchor |
+
+**注意**: `lambda_pose_anchor` が大きすぎると、被写体が首を振っても
+optimizer が DECA 初期推定の周囲に固定されてしまい、頭の動きが追従しなく
+なります。`lambda_shape` の上げ幅に対して `lambda_pose_anchor` も控えめに
+(0.1〜0.2 程度から) 探るのが安全です。
+
 ## 使い方
 
 ### 既定（自動適用）
@@ -90,6 +138,15 @@ bash demos/demo_1_train_subject.sh \
     --lambda-shape 1.0
 ```
 
+### shape を強く絞った副作用（顔向き過剰回転）も同時に抑える
+
+```bash
+bash demos/demo_1_train_subject.sh \
+    --sbj-root ./data/subjects --sbj-name MK6c \
+    --video ./data/raw/mikawa6c.mp4 --intrinsics hdtf \
+    --lambda-shape 1.0 --lambda-pose-anchor 0.1
+```
+
 ### パッチを手動管理したい
 
 ```bash
@@ -105,21 +162,17 @@ python tools/patches/apply_deca_optimize_regularizer.py
 # パッチ単独適用（冪等。複数回 OK）
 python tools/patches/apply_deca_stable_bbox.py
 python tools/patches/apply_deca_optimize_regularizer.py
+python tools/patches/apply_deca_pose_anchor.py
 
 # 別 DECA チェックアウトに対して
 python tools/patches/apply_deca_optimize_regularizer.py /path/to/DECA
+python tools/patches/apply_deca_pose_anchor.py /path/to/DECA
 ```
 
 ## マーカ
 
-各パッチは識別マーカをコメントで埋め込み、再適用時に検出します。
-
-| パッチ | マーカ |
-|---|---|
-| `apply_deca_stable_bbox.py` | `# HRAVATAR_STABLE_BBOX` |
-| `apply_deca_optimize_regularizer.py` | `# HRAVATAR_OPTIMIZE_REGULARIZER` |
-
-確認:
+各パッチは識別マーカをコメントで埋め込み、再適用時に検出します（一覧は
+冒頭表参照）。確認:
 
 ```bash
 grep -n HRAVATAR_ preprocess/submodules/DECA/optimize.py
