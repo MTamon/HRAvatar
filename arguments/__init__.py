@@ -174,11 +174,61 @@ def add_more_argument(parser):
     parser.add_argument("--render_and_eval", action='store_true', default = True,
                         help="Rendering train and test set and evaluate the results after training")
     parser.add_argument("--test_set_ratio", type=float, default = 0.15)
-    parser.add_argument("--test_set_num", type=int, default = -1) 
+    parser.add_argument("--test_set_num", type=int, default = -1)
     parser.add_argument("--other_train_set_path", type=str,nargs="+", default = "")
     parser.add_argument("--test_set_path", type=str,nargs="+", default = "")
     parser.add_argument("--non_mouth_interior", action='store_true', default = False,)
     parser.add_argument("--nersemble_id",type=str, default = "",)
+
+    # ---- One-Euro jitter mitigation (Gaussian-HS port) ----------------------
+    # All flags are opt-in. Default behaviour is unchanged.
+    # See doc/jitter_filter.md.
+    parser.add_argument(
+        "--jitter_filter", action="store_true", default=False,
+        help=(
+            "Enable One-Euro temporal smoothing of per-frame tracker params. "
+            "Off by default. When set, the targets in --jitter_filter_targets "
+            "are smoothed at TrackedData load time, and SMIRK encoder outputs "
+            "are smoothed at render time when --jitter_filter_smirk is set."
+        ),
+    )
+    parser.add_argument(
+        "--jitter_filter_targets", type=str, nargs="+",
+        default=["translation", "fullpose", "expression", "eyelid"],
+        choices=["translation", "fullpose", "expression", "eyelid", "world_mat"],
+        help=(
+            "Which tracked_params channels to smooth at load time. "
+            "Active only when --jitter_filter is set. 'world_mat' smooths the "
+            "per-frame extrinsics translation (camera follow) -- only useful "
+            "if the camera was tracked rather than fixed."
+        ),
+    )
+    parser.add_argument(
+        "--jitter_filter_smirk", action="store_true", default=False,
+        help=(
+            "Also apply causal One-Euro smoothing to SMIRK encoder outputs "
+            "(expression / jaw / eyelid) at render time. Active only when "
+            "--jitter_filter is set. Slightly degrades responsiveness; useful "
+            "for offline render of long sequences."
+        ),
+    )
+    parser.add_argument(
+        "--jitter_filter_min_cutoff", type=float, default=1.0,
+        help="One-Euro min_cutoff (Hz). Lower => smoother static. Default 1.0.",
+    )
+    parser.add_argument(
+        "--jitter_filter_beta", type=float, default=0.0,
+        help="One-Euro beta (speed coefficient). Higher => more responsive. "
+             "Default 0.0 (pure low-pass).",
+    )
+    parser.add_argument(
+        "--jitter_filter_d_cutoff", type=float, default=1.0,
+        help="One-Euro derivative cutoff (Hz). Default 1.0.",
+    )
+    parser.add_argument(
+        "--jitter_filter_fps", type=float, default=30.0,
+        help="Frame rate used to set the One-Euro time step. Default 30.",
+    )
 
     return parser
 

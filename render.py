@@ -11,6 +11,7 @@ from utils.general_utils import safe_state,to8b,save_image_L
 from utils.camera_utils import generate_multi_view_poses
 from utils.graphics_utils import normal_from_depth_image
 from scene.data_loader import TrackedData
+from utils.onefilter import CausalOneEuroBuffer
 from net_modules.NVDIFFREC.util import cubemap_to_latlong
 
 from argparse import ArgumentParser
@@ -20,6 +21,45 @@ import numpy as np
 from net_modules.NVDIFFREC.envmap import EnvironmentMap_relight
 from copy import deepcopy
 from natsort import natsorted
+
+def _maybe_attach_smirk_smoother(gaussians, all_args):
+    """Install a causal One-Euro buffer on `gaussians` for SMIRK smoothing.
+
+    Returns the smoother (so the caller can reset it between sequences) or
+    ``None`` if smoothing is disabled / not applicable.
+    """
+    if not getattr(all_args, "jitter_filter", False):
+        return None
+    if not getattr(all_args, "jitter_filter_smirk", False):
+        return None
+    if not getattr(gaussians, "with_param_net_smirk", False):
+        return None
+    smoother = CausalOneEuroBuffer(
+        fps=getattr(all_args, "jitter_filter_fps", 30.0),
+        min_cutoff=getattr(all_args, "jitter_filter_min_cutoff", 1.0),
+        beta=getattr(all_args, "jitter_filter_beta", 0.0),
+        d_cutoff=getattr(all_args, "jitter_filter_d_cutoff", 1.0),
+    )
+    gaussians.set_smirk_smoother(smoother)
+    print(f"[render] SMIRK output smoothing enabled "
+          f"(min_cutoff={smoother.min_cutoff} Hz, beta={smoother.beta}, "
+          f"fps={smoother.fps})")
+    return smoother
+
+
+def _reset_smirk_smoother(gaussians, smoother):
+    """Reset buffer state at sequence boundary so causal filter restarts."""
+    if smoother is not None:
+        smoother.reset()
+    elif gaussians is not None and hasattr(gaussians, "set_smirk_smoother"):
+        # No-op if smoother is None but keeps API symmetric.
+        pass
+
+
+def _detach_smirk_smoother(gaussians):
+    if gaussians is not None and hasattr(gaussians, "set_smirk_smoother"):
+        gaussians.set_smirk_smoother(None)
+
 
 def render_set(model_path, name, epoch, cam_params, gaussians, pipeline, background,args):
     render=gaussian_renderer.render_with_deferred
@@ -494,14 +534,23 @@ def render_sets(dataset_args : ModelParams, epoch : int, pipeline : PipelinePara
 
 
         test_rendering_speed(dataset_args.model_path, train_dataset, gaussians, pipeline, background,all_args)
+
+        # Install SMIRK output smoother once; reset between independent sequences.
+        smirk_smoother = _maybe_attach_smirk_smoother(gaussians, all_args)
+
         if not skip_train:
+             _reset_smirk_smoother(gaussians, smirk_smoother)
              render_set(dataset_args.model_path, "train", scene.loaded_epoch, train_dataset, gaussians, pipeline, background,all_args)
         if not skip_test:
+             _reset_smirk_smoother(gaussians, smirk_smoother)
              render_set(dataset_args.model_path, "test", scene.loaded_epoch, test_dataset, gaussians, pipeline, background,all_args)
-             
+
         if all_args.render_multi_views:
+            _reset_smirk_smoother(gaussians, smirk_smoother)
             render_multi_views(dataset_args.model_path, "train", scene.loaded_epoch, train_dataset, gaussians, pipeline, background)
+            _reset_smirk_smoother(gaussians, smirk_smoother)
             render_multi_views(dataset_args.model_path, "test", scene.loaded_epoch, test_dataset, gaussians, pipeline, background)
+
         
         if all_args.render_envmap:
             render_envmap(dataset_args.model_path,scene.loaded_epoch,gaussians)
@@ -516,6 +565,7 @@ def render_sets(dataset_args : ModelParams, epoch : int, pipeline : PipelinePara
         if len(all_args.train_static_multiviews_idxs) >0:
             render_static_multi_views(dataset_args.model_path, "train", scene.loaded_epoch, train_dataset, gaussians, pipeline, background,all_args.train_static_multiviews_idxs)
         if len(all_args.corss_source_paths)!=0:
+            _reset_smirk_smoother(gaussians, smirk_smoother)
             render_cross_reenactment(dataset_args.model_path,test_dataset, scene.loaded_epoch, gaussians, pipeline, background,all_args)
         if len(all_args.test_static_relight_idxs)>0:
             render_static_relighting(dataset_args.model_path, "test", scene.loaded_epoch, test_dataset, gaussians, pipeline, background,all_args,all_args.test_static_relight_idxs)
@@ -528,6 +578,9 @@ def render_sets(dataset_args : ModelParams, epoch : int, pipeline : PipelinePara
 
         if all_args.source_params_path!="":
             extract_optimized_params(train_dataset,test_dataset, gaussians,all_args.source_params_path)
+
+        # Done with sequential renders — drop the smoother reference.
+        _detach_smirk_smoother(gaussians)
 
     gaussians.set_eval(False)
 if __name__ == "__main__":
