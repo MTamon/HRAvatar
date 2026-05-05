@@ -6,18 +6,23 @@ remaining wobble is encoder-stage residual or upstream bbox jitter.
 
 What's drawn per frame
 ----------------------
-- **Cyan rectangle**  : the legacy bbox = all-landmarks min/max (the source
+- **Cyan rectangle**   : the legacy bbox = all-landmarks min/max (the source
   of the original "breathing" jitter). Reconstructed from the cached raw
   MediaPipe landmarks during this pass — we don't depend on the npz holding
   legacy series.
-- **Yellow rectangle**: the stable-subset bbox **before** FIR LPF (raw
+- **Yellow rectangle** : the stable-subset bbox **before** FIR LPF (raw
   series stored in `stable_bbox.npz`). Shows what the calibration alone buys.
-- **Green rectangle** : the stable-subset bbox **after** FIR LPF (the
-  series that DECA / SMIRK actually consume). Should sit very still even
-  when the mouth opens or the subject blinks.
-- **Red dots**        : the 15 stable landmark indices for sanity.
-- **HUD**             : frame index, detection flag, raw vs smoothed size,
-  and `Δsize` (frame-to-frame absolute difference, in source-image px).
+- **Green rectangle**  : raw-center + FIR-smoothed-size, **without** the
+  K-of-N hysteresis center follower. Useful for separating "what FIR
+  alone bought" from "what hysteresis added".
+- **Magenta rectangle**: the actual emitted bbox (smoothed center via
+  K-of-N hysteresis follower, smoothed size via FIR LPF). This is what
+  DECA / SMIRK actually consume. Should sit very still even during
+  sustained head turns or large pose changes.
+- **Red dots**         : the 15 stable landmark indices for sanity.
+- **HUD**              : frame index, detection flag, raw vs smoothed size,
+  per-frame |Δsize|, |raw_center - anchor| displacement, and the K-of-N
+  motion flag.
 
 A `bbox_verify_stats.csv` is written alongside the video with per-frame
 numerical values so jitter can be quantified, not just eyeballed.
@@ -45,10 +50,12 @@ from utils.general_utils import natural_sort_key, run_mediapipe
 
 
 # Colours are BGR for cv2.
-LEGACY_COLOR = (255, 200, 0)     # cyan-ish
-RAW_STABLE_COLOR = (0, 200, 255) # amber
-SMOOTH_COLOR = (0, 220, 0)       # green
-LANDMARK_COLOR = (0, 0, 220)     # red
+LEGACY_COLOR = (255, 200, 0)        # cyan-ish
+RAW_STABLE_COLOR = (0, 200, 255)    # amber
+SMOOTH_COLOR = (0, 220, 0)          # green (raw-center + smoothed-size)
+HYSTERESIS_COLOR = (220, 0, 220)    # magenta (smoothed-center + smoothed-size)
+LANDMARK_COLOR = (0, 0, 220)        # red
+MOTION_FLAG_COLOR = (0, 255, 255)   # yellow accent for HUD when flag is set
 HUD_BG = (0, 0, 0)
 HUD_FG = (255, 255, 255)
 
@@ -61,7 +68,7 @@ def _list_frames(image_dir: Path) -> list[Path]:
     return [Path(p) for p in paths]
 
 
-def _draw_bbox(frame, center, size, color, scale: float = 1.4, label: str = ''):
+def _draw_bbox(frame, center, size, color, scale: float = 1.6, label: str = ''):
     """Draw a `scale * size` square centred at `center`, axis-aligned. The
     drawn rectangle matches what `crop_face` would extract for warping."""
     half = (float(size) * float(scale)) / 2.0
@@ -107,6 +114,14 @@ def make_verify_video(
     raw_sizes = npz['raw_size']
     detected = npz['detected']
     expected_basenames = npz['frame_basenames']
+    # Hysteresis diagnostics are written by stable_bbox.py >= the K-of-N
+    # update; older npz files predate them, so fall back gracefully.
+    if 'target_center' in npz.files:
+        target_centers = npz['target_center']
+        motion_flags = npz['motion_flag']
+    else:
+        target_centers = raw_centers.copy()
+        motion_flags = np.zeros(len(raw_centers), dtype=bool)
 
     frames = _list_frames(image_dir)
     if len(frames) != len(expected_basenames):
@@ -161,20 +176,31 @@ def make_verify_video(
 
         _draw_bbox(bgr, raw_centers[i], float(raw_sizes[i]),
                    RAW_STABLE_COLOR, label='stable raw')
+        # Green = the FIR-only bbox (raw center + smoothed size). Lets
+        # the viewer separate "what FIR did" from "what hysteresis did".
+        _draw_bbox(bgr, raw_centers[i], float(smooth_sizes[i]),
+                   SMOOTH_COLOR, label='FIR size')
+        # Magenta = the actual emitted bbox (smoothed center via the
+        # K-of-N hysteresis follower + smoothed size).
         _draw_bbox(bgr, smooth_centers[i], float(smooth_sizes[i]),
-                   SMOOTH_COLOR, label='stable + FIR')
+                   HYSTERESIS_COLOR, label='hysteresis')
 
         d_raw = (abs(float(raw_sizes[i]) - prev_raw_size)
                  if prev_raw_size is not None else 0.0)
         d_smooth = (abs(float(smooth_sizes[i]) - prev_smooth_size)
                     if prev_smooth_size is not None else 0.0)
+        disp_to_anchor = float(np.linalg.norm(
+            raw_centers[i] - smooth_centers[i]))
+        motion_flag = bool(motion_flags[i])
+        flag_label = 'MOVE' if motion_flag else 'hold'
 
         _draw_hud(bgr, [
             f'f={i:05d}  det={int(bool(detected[i]))}  redet={int(redet)}',
             f'raw   size={float(raw_sizes[i]):7.2f} px   d|s|={d_raw:6.3f}',
             f'smooth size={float(smooth_sizes[i]):7.2f} px   d|s|={d_smooth:6.3f}',
-            f'center=({float(smooth_centers[i,0]):7.2f},'
+            f'anchor=({float(smooth_centers[i,0]):7.2f},'
             f'{float(smooth_centers[i,1]):7.2f})',
+            f'disp_to_anchor={disp_to_anchor:6.2f} px   K-of-N={flag_label}',
         ])
 
         writer.write(bgr)
@@ -189,6 +215,10 @@ def make_verify_video(
             'smooth_center_x': float(smooth_centers[i, 0]),
             'smooth_center_y': float(smooth_centers[i, 1]),
             'smooth_size': float(smooth_sizes[i]),
+            'target_center_x': float(target_centers[i, 0]),
+            'target_center_y': float(target_centers[i, 1]),
+            'disp_to_anchor': disp_to_anchor,
+            'motion_flag': int(motion_flag),
             'd_raw_size': d_raw,
             'd_smooth_size': d_smooth,
         })

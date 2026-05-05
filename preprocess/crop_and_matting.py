@@ -34,31 +34,31 @@ def _print_subprocess_output(stdout, stderr, tag, returncode):
     print(f"[{tag}] returncode={returncode}")
 
 
-def get_bbox(image, lmks, bb_scale=2.0):
-    h, w, c = image.shape
-    lmks = lmks.astype(np.int32)
-    x_min, x_max, y_min, y_max = np.min(lmks[:, 0]), np.max(lmks[:, 0]), np.min(lmks[:, 1]), np.max(lmks[:, 1])
-    x_center, y_center = int((x_max + x_min) / 2.0), int((y_max*0.2 + y_min*0.8))
-    size = int(bb_scale * 2 * max(x_center - x_min, y_center - y_min))
-    xb_min, xb_max, yb_min, yb_max = max(x_center - size // 2, 0), min(x_center + size // 2, w - 1), \
-        max(y_center - size // 2, 0), min(y_center + size // 2, h - 1)
-
-    yb_max = min(yb_max, h - 1)
-    xb_max = min(xb_max, w - 1)
-    yb_min = max(yb_min, 0)
-    xb_min = max(xb_min, 0)
-
-    if (xb_max - xb_min) % 2 != 0:
-        xb_min += 1
-
-    if (yb_max - yb_min) % 2 != 0:
-        yb_min += 1
-
-    return np.array([xb_min, xb_max, yb_min, yb_max])
-
-
 def crop_image(image, x_min, y_min, x_max, y_max):
-    return image[max(y_min, 0):min(y_max, image.shape[0] - 1), max(x_min, 0):min(x_max, image.shape[1] - 1), :]
+    """Crop ``image`` to ``[y_min:y_max, x_min:x_max]`` with zero-padding for
+    any portion of the bbox that falls outside the image.
+
+    Plan B (video-wide fixed outer bbox) sizes the bbox as
+    ``bbox_scale * 2 * half_extent`` and expects the result to be exactly
+    that square. The legacy clip-to-image-bounds behaviour collapsed the
+    bbox onto the short edge whenever the head's motion envelope exceeded
+    it, which made ``bbox_scale`` non-linear (it hit the bounds before the
+    requested margin took effect). Padding keeps ``bbox_scale`` linear so
+    operators can dial face-fraction-of-canvas directly.
+    """
+    h, w = image.shape[:2]
+    pad_l = max(-x_min, 0)
+    pad_r = max(x_max - w, 0)
+    pad_t = max(-y_min, 0)
+    pad_b = max(y_max - h, 0)
+    if pad_l or pad_r or pad_t or pad_b:
+        image = np.pad(image, [(pad_t, pad_b), (pad_l, pad_r), (0, 0)],
+                       mode='constant')
+        x_min += pad_l
+        x_max += pad_l
+        y_min += pad_t
+        y_max += pad_t
+    return image[y_min:y_max, x_min:x_max, :]
 
 
 def squarefiy(image, size=512):
@@ -94,7 +94,7 @@ class Crop_and_matting(Dataset, ABC):
     def initialize(self):
         self.image_path = Path(self.source,'image')
         image_path=self.image_path
-        
+
         if not image_path.exists() or len(os.listdir(str(image_path))) == 0:
             #video_file = self.source / 'video.mp4'
             # video_files = glob(os.path.join(self.source, '*.mp4'))
@@ -108,8 +108,23 @@ class Crop_and_matting(Dataset, ABC):
                 logger.error(f'[ImagesDataset] Neither images nor a video was provided! Execution has stopped! {video_file}')
                 exit(1)
             image_path.mkdir(parents=True, exist_ok=True)
-            
-            os.system(f'ffmpeg -i {video_file} -vf fps={self.config.fps} -start_number 0 -q:v 1 {image_path}/%05d.png')#%05d
+
+            # Prescale to short_side = image_size before extracting frames.
+            # Without this step the bbox stage (which inherits the source-
+            # video resolution) makes the absolute face px size depend on
+            # the input video's resolution, making the same `bb_scale` look
+            # too tight on 1080p input and too loose on 360p input. Use
+            # `-2` to preserve the aspect ratio while keeping dims even.
+            target = int(self.config.image_size[0])
+            no_prescale = bool(getattr(self.config, 'no_prescale', False))
+            if no_prescale:
+                vf = f'fps={self.config.fps}'
+            else:
+                vf = (
+                    f"scale='if(gt(iw,ih),-2,{target})':"
+                    f"'if(gt(iw,ih),{target},-2)',fps={self.config.fps}"
+                )
+            os.system(f'ffmpeg -i {video_file} -vf "{vf}" -start_number 0 -q:v 1 {image_path}/%05d.png')#%05d
 
         self.images = sorted(glob(f'{image_path}/*.jpg') + glob(f'{image_path}/*.png'),key=natural_sort_key)
 
@@ -215,33 +230,98 @@ class Crop_and_matting(Dataset, ABC):
 
         print("Processing complete!")
 
+    def _compute_video_wide_outer_bbox(self):
+        """Compute a single outer bbox shared by every frame.
+
+        Per-frame following crops absorb the head's translation into a
+        time-varying crop offset, which then gets baked out of FLAME
+        ``translation_code`` — the very signal that head-motion-generation
+        downstream models need. Holding the crop offset constant across
+        frames keeps that translation in FLAME where it belongs.
+
+        Pass 1: run face_alignment on every frame and collect the bbox
+        endpoints (frames where detection fails are skipped — the union
+        is dominated by the broader of the *successful* detections).
+        Pass 2: take the union (min/max) over all successful frames so
+        the bbox covers the head's full motion envelope across the video.
+        Pass 3: inflate by ``bbox_scale``, square via the long edge, and
+        parity-correct. The bbox is *not* clipped to image bounds;
+        :func:`crop_image` handles out-of-bounds by zero-padding so
+        ``bbox_scale`` stays linear (clipping the bbox here would collapse
+        it onto the short edge whenever the head's motion envelope
+        exceeded it, defeating the requested margin).
+        """
+        cfg = self.config
+        logger.info('Computing video-wide outer bbox (FAN union over all frames)...')
+
+        x_mins: list[float] = []
+        x_maxs: list[float] = []
+        y_mins: list[float] = []
+        y_maxs: list[float] = []
+        for imagepath in tqdm(self.images, desc='outer_bbox/fan'):
+            image = cv2.imread(imagepath)
+            if cfg.crop_range is not None:
+                image = image[cfg.crop_range[0]:cfg.crop_range[1],
+                              cfg.crop_range[2]:cfg.crop_range[3], :]
+            lmk = self.process_face(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            if lmk is None:
+                continue
+            lmk = np.asarray(lmk)
+            x_mins.append(float(np.min(lmk[:, 0])))
+            x_maxs.append(float(np.max(lmk[:, 0])))
+            y_mins.append(float(np.min(lmk[:, 1])))
+            y_maxs.append(float(np.max(lmk[:, 1])))
+
+        if not x_mins:
+            raise RuntimeError(
+                'face_alignment detected no face in any frame. Verify the '
+                'input video has a visible face throughout, then re-run '
+                'crop_and_matting.py.')
+
+        u_xmin, u_xmax = min(x_mins), max(x_maxs)
+        u_ymin, u_ymax = min(y_mins), max(y_maxs)
+        x_center = int(round((u_xmin + u_xmax) / 2.0))
+        y_center = int(round((u_ymin + u_ymax) / 2.0))
+        half_extent = max((u_xmax - u_xmin) / 2.0, (u_ymax - u_ymin) / 2.0)
+        size = int(cfg.bbox_scale * 2 * half_extent)
+        xb_min = x_center - size // 2
+        xb_max = x_center + size // 2
+        yb_min = y_center - size // 2
+        yb_max = y_center + size // 2
+
+        if (xb_max - xb_min) % 2 != 0:
+            xb_min += 1
+        if (yb_max - yb_min) % 2 != 0:
+            yb_min += 1
+
+        return np.array([xb_min, xb_max, yb_min, yb_max])
+
     def run(self):
 
-        
-        logger.info('Croping dataset...')
-        bbox = None
-        for imagepath in tqdm(self.images):
-            if 1:
-                image = cv2.imread(imagepath)
-                if self.config.crop_range is not None:
-                    image = image[self.config.crop_range[0]:self.config.crop_range[1], self.config.crop_range[2]:self.config.crop_range[3],:]
-                h, w, c = image.shape
-                
-                if bbox is None :
-                    print("geting box")
-                    lmk = self.process_face(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))  # estimate initial bbox
-                    bbox = get_bbox(image, lmk, bb_scale=self.config.bbox_scale)
-                    # torch.save(bbox, bbox_path)
+        logger.info('Croping dataset (video-wide fixed outer bbox)...')
+        cfg = self.config
+        bbox = self._compute_video_wide_outer_bbox()
+        logger.info(
+            f'video-wide outer bbox (xmin,xmax,ymin,ymax)={bbox.tolist()}')
 
-                if self.config.crop_image and self.config.crop_image:
-                    image = crop_image_bbox(image, bbox)
-                    if self.config.image_size[0] == self.config.image_size[1]:
-                        image = squarefiy(image, size=self.config.image_size[0])
-                elif image.shape[0] != self.config.image_size[0] or image.shape[1] != self.config.image_size[1]:
-                    image = cv2.resize(image, (self.config.image_size[1], self.config.image_size[0]), interpolation=cv2.INTER_CUBIC)
-                    
-                cv2.imwrite(imagepath, image)
-            
+        for imagepath in tqdm(self.images, desc='outer_crop'):
+            image = cv2.imread(imagepath)
+            if cfg.crop_range is not None:
+                image = image[cfg.crop_range[0]:cfg.crop_range[1],
+                              cfg.crop_range[2]:cfg.crop_range[3], :]
+
+            if cfg.crop_image:
+                image = crop_image_bbox(image, bbox)
+                if cfg.image_size[0] == cfg.image_size[1]:
+                    image = squarefiy(image, size=cfg.image_size[0])
+            elif image.shape[0] != cfg.image_size[0] or image.shape[1] != cfg.image_size[1]:
+                image = cv2.resize(
+                    image, (cfg.image_size[1], cfg.image_size[0]),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+
+            cv2.imwrite(imagepath, image)
+
         if self.config.matting:
             logger.info("Matting dataset...")
             save_mask_path=os.path.join(self.source,"mask")
@@ -269,6 +349,15 @@ if __name__ == '__main__':
     parser.add_argument("--bbox_scale",type=float,default=2.2,help='bbox scale')#2.5
     parser.add_argument("--matting", action='store_true', help='Matting images')
     parser.add_argument("--mask_clothes",type=lambda x: x.lower() in ['true', '1'], default=True, help='remove cloth')
+    parser.add_argument("--no_prescale", action='store_true',
+                        help='Skip the short-side prescale during ffmpeg '
+                             'extraction. Default behaviour scales the input '
+                             'video so its short side equals --image_size '
+                             'before frames are written, normalising the '
+                             'apparent face size across input resolutions. '
+                             'Set this when the input video already has the '
+                             'expected short-side resolution AND the camera '
+                             'intrinsics passed downstream are pinned to it.')
 
     args=parser.parse_args(sys.argv[1:])
     crop_and_matting = Crop_and_matting(args.source, args)

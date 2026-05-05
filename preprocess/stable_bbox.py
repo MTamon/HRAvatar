@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, asdict
@@ -78,12 +79,26 @@ WINDOW_SECONDS = 2.0  # FIR window length in seconds; matches FlashAvatar's
 class StableBboxConfig:
     fps: float
     cutoff_hz: float = 2.5
-    scale: float = 1.4
+    # scale=1.6 (was 1.4) gives the K-of-N center hysteresis follower enough
+    # margin so the face never leaves the 224 crop while the anchor is
+    # catching up to a new target. Combined with the stable-subset
+    # calibration (1.55) the effective bbox is ~2.48x the inter-landmark
+    # extent.
+    scale: float = 1.6
     image_size: int = 224
     use_stable_subset: bool = True
     size_calibration: float = STABLE_LANDMARK_SIZE_CALIBRATION
     smooth_center: bool = False
     center_cutoff_hz: float | None = None
+    # K-of-N hysteresis center follower (Pass 2 default for `center`).
+    # When `center_passthrough` is True, both this and `smooth_center`
+    # are bypassed and the raw centers are written verbatim.
+    use_center_hysteresis: bool = True
+    center_passthrough: bool = False
+    center_deadzone_px: float = 4.0
+    center_window: int = 5
+    center_k_of_n: int = 3
+    center_tau: float = 0.25
 
 
 # --- Geometry helpers (mirror MTamon/smirk utils/bbox_tracker.py) ----------
@@ -194,6 +209,111 @@ def fir_lowpass_offline(
     return np.convolve(padded, coef, mode='valid')
 
 
+# --- K-of-N hysteresis center follower -------------------------------------
+
+def _hysteresis_forward(
+    raw_centers: np.ndarray,
+    fps: float,
+    deadzone_px: float,
+    window: int,
+    k_of_n: int,
+    tau: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One-direction hysteresis follower. Returns ``(anchor, target, flag)``
+    arrays each of shape ``(N, 2)`` (target/anchor) or ``(N,)`` (flag).
+
+    State machine:
+      - ``anchor`` is the currently emitted center; ``target`` is the
+        candidate to chase. Both initialised to ``raw_centers[0]``.
+      - For each frame, compute ``disp = ||raw - anchor||`` and append
+        ``disp > deadzone_px`` to a sliding boolean ring of size ``window``.
+      - When K-of-N condition holds, refresh ``target`` to the mean of
+        the last ``window`` raw centers (smoothing out the very landmark
+        jitter we are trying to reject); otherwise hold ``target``.
+      - Always exponentially advance ``anchor`` toward ``target`` with
+        time constant ``tau`` (seconds): ``alpha = 1 - exp(-dt/tau)``.
+    """
+    n = raw_centers.shape[0]
+    dt = 1.0 / float(fps)
+    alpha = 1.0 - math.exp(-dt / max(float(tau), 1e-6))
+
+    anchor = raw_centers[0].astype(np.float64).copy()
+    target = anchor.copy()
+    anchors = np.empty_like(raw_centers, dtype=np.float64)
+    targets = np.empty_like(raw_centers, dtype=np.float64)
+    flags = np.zeros(n, dtype=bool)
+
+    # Sliding boolean ring of length `window`. We accept K-of-N when the
+    # number of `disp > deadzone` samples in the last `window` frames
+    # reaches `k_of_n` (inclusive).
+    ring_len = max(int(window), 1)
+    ring = np.zeros(ring_len, dtype=bool)
+    k_thresh = max(1, min(int(k_of_n), ring_len))
+
+    for i in range(n):
+        disp = float(np.linalg.norm(raw_centers[i] - anchor))
+        ring[i % ring_len] = disp > float(deadzone_px)
+        # Once we have at least one full window of history; before that
+        # the ring's untouched slots remain `False`, so the K-of-N test
+        # stays conservative (tends to "no motion") on early frames.
+        flag = bool(ring.sum() >= k_thresh)
+        flags[i] = flag
+
+        if flag:
+            lo = max(0, i - ring_len + 1)
+            target = raw_centers[lo:i + 1].mean(axis=0).astype(np.float64)
+        # else: target held from previous iteration
+
+        anchor = anchor + (target - anchor) * alpha
+        anchors[i] = anchor
+        targets[i] = target
+
+    return anchors, targets, flags
+
+
+def apply_center_hysteresis(
+    raw_centers: np.ndarray,
+    fps: float,
+    deadzone_px: float = 4.0,
+    window: int = 5,
+    k_of_n: int = 3,
+    tau: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bidirectional zero-phase K-of-N hysteresis center follower.
+
+    The forward pass produces a causal output; running the same filter on
+    the time-reversed input and averaging gives a zero-net-phase result,
+    matching the spirit of `fir_lowpass_offline`'s zero-phase design.
+
+    Returns
+    -------
+    smooth_centers : (N, 2) the followed center series (averaged forward+backward).
+    target_centers : (N, 2) the forward-pass target — diagnostic only.
+    motion_flags   : (N,)  forward-pass K-of-N flag — diagnostic only.
+
+    Diagnostics use the forward pass alone so they reflect the causal,
+    real-time behaviour (the reverse pass is an offline trick to remove
+    phase delay, not a separate decision).
+    """
+    raw = np.asarray(raw_centers, dtype=np.float64)
+    if raw.ndim != 2 or raw.shape[1] != 2:
+        raise ValueError('raw_centers must be (N, 2)')
+    if raw.shape[0] < 2:
+        return raw.copy(), raw.copy(), np.zeros(raw.shape[0], dtype=bool)
+
+    fwd_anchor, fwd_target, fwd_flag = _hysteresis_forward(
+        raw, fps=fps, deadzone_px=deadzone_px, window=window,
+        k_of_n=k_of_n, tau=tau,
+    )
+    bwd_anchor, _, _ = _hysteresis_forward(
+        raw[::-1], fps=fps, deadzone_px=deadzone_px, window=window,
+        k_of_n=k_of_n, tau=tau,
+    )
+    bwd_anchor = bwd_anchor[::-1]
+    smooth = 0.5 * (fwd_anchor + bwd_anchor)
+    return smooth, fwd_target, fwd_flag
+
+
 # --- Pipeline --------------------------------------------------------------
 
 def _make_detector():
@@ -270,23 +390,41 @@ def compute_stable_bbox(
     raw_centers_np = np.stack(raw_centers, axis=0)
     raw_sizes_np = np.asarray(raw_sizes, dtype=np.float64)
 
-    # Pass 2: zero-phase FIR LPF on the size series. Centers are kept raw
-    # by default (head translation is real motion we want to track) unless
-    # the operator explicitly asks via `--smooth-center`.
+    # Pass 2: zero-phase FIR LPF on the size series. Centers go through the
+    # K-of-N hysteresis follower by default (rejects per-frame landmark
+    # noise, refuses to chase brief excursions, and exponentially follows
+    # only when motion is sustained). `--smooth_center` switches the
+    # center channel to FIR LPF instead, and `--center_passthrough` skips
+    # both, recovering the legacy raw-center behaviour.
     taps = compute_taps(cfg.fps)
     smooth_sizes = fir_lowpass_offline(
         raw_sizes_np, fps=cfg.fps, cutoff_hz=cfg.cutoff_hz, taps=taps,
     )
-    smooth_centers = raw_centers_np.copy()
-    if cfg.smooth_center:
+    motion_flags = np.zeros(len(frames), dtype=bool)
+    target_centers = raw_centers_np.copy()
+    if cfg.center_passthrough:
+        smooth_centers = raw_centers_np.copy()
+    elif cfg.smooth_center:
         cc = (cfg.center_cutoff_hz
               if cfg.center_cutoff_hz is not None else cfg.cutoff_hz)
+        smooth_centers = raw_centers_np.copy()
         smooth_centers[:, 0] = fir_lowpass_offline(
             raw_centers_np[:, 0], fps=cfg.fps, cutoff_hz=cc, taps=taps,
         )
         smooth_centers[:, 1] = fir_lowpass_offline(
             raw_centers_np[:, 1], fps=cfg.fps, cutoff_hz=cc, taps=taps,
         )
+    elif cfg.use_center_hysteresis:
+        smooth_centers, target_centers, motion_flags = apply_center_hysteresis(
+            raw_centers_np,
+            fps=cfg.fps,
+            deadzone_px=cfg.center_deadzone_px,
+            window=cfg.center_window,
+            k_of_n=cfg.center_k_of_n,
+            tau=cfg.center_tau,
+        )
+    else:
+        smooth_centers = raw_centers_np.copy()
 
     # Pre-build per-frame similarity transforms so consumers can drop them
     # directly into `warp(img, tform_inverse)`.
@@ -313,6 +451,11 @@ def compute_stable_bbox(
         # (a few hundred kB).
         raw_center=raw_centers_np,
         raw_size=raw_sizes_np,
+        # Hysteresis diagnostics (forward-pass causal target and K-of-N
+        # flag). All zeros / equal to raw when the center path is
+        # `passthrough` or `smooth_center`.
+        target_center=target_centers,
+        motion_flag=motion_flags,
     )
 
     meta = asdict(cfg)
@@ -361,9 +504,11 @@ def main(argv: list[str] | None = None) -> int:
                              'normalisation against Nyquist.')
     parser.add_argument('--cutoff_hz', type=float, default=2.5,
                         help='FIR cutoff for the size series (default 2.5).')
-    parser.add_argument('--scale', type=float, default=1.4,
-                        help='bbox scale factor; matches data_loader.py '
-                             'crop_face(..., scale=1.4) (default 1.4).')
+    parser.add_argument('--scale', type=float, default=1.6,
+                        help='bbox scale factor (default 1.6, raised from '
+                             'legacy 1.4 to give the K-of-N center follower '
+                             'enough margin while it catches up to a new '
+                             'target). Override to 1.4 for legacy crops.')
     parser.add_argument('--image_size', type=int, default=224,
                         help='Output crop size; matches the SMIRK encoder '
                              'input (default 224).')
@@ -372,12 +517,31 @@ def main(argv: list[str] | None = None) -> int:
                              'MediaPipe landmarks (legacy bbox source). '
                              'Use only when the stable subset misbehaves.')
     parser.add_argument('--smooth_center', action='store_true',
-                        help='Also FIR-smooth the bbox center. Off by '
-                             'default — head translation should track real '
-                             'motion faithfully.')
+                        help='FIR-smooth the bbox center (mutually exclusive '
+                             'with the K-of-N hysteresis follower). Off by '
+                             'default; the hysteresis path is preferred for '
+                             'rejecting per-frame landmark jitter without '
+                             'lagging on real head motion.')
     parser.add_argument('--center_cutoff_hz', type=float, default=None,
                         help='Center-channel cutoff (default: same as '
                              '--cutoff_hz when --smooth_center is set).')
+    parser.add_argument('--center_passthrough', action='store_true',
+                        help='Bypass both FIR and hysteresis; emit raw '
+                             'centers verbatim (legacy behaviour). Useful '
+                             'for A/B comparison.')
+    parser.add_argument('--center_deadzone_px', type=float, default=4.0,
+                        help='K-of-N hysteresis deadzone in source-image '
+                             'pixels (default 4.0). Per-frame |raw - anchor| '
+                             'below this is treated as landmark noise.')
+    parser.add_argument('--center_window', type=int, default=5,
+                        help='K-of-N window size N in frames (default 5).')
+    parser.add_argument('--center_k_of_n', type=int, default=3,
+                        help='K-of-N threshold K (default 3). Motion is '
+                             'declared sustained when at least K of the '
+                             'last N frames exceed --center_deadzone_px.')
+    parser.add_argument('--center_tau', type=float, default=0.25,
+                        help='Center-follower exponential time constant '
+                             'in seconds (default 0.25).')
     parser.add_argument('--output', type=str, default=None,
                         help='Output npz path. Defaults to '
                              '<source>/stable_bbox.npz.')
@@ -398,6 +562,14 @@ def main(argv: list[str] | None = None) -> int:
             float(args.center_cutoff_hz)
             if args.center_cutoff_hz is not None else None
         ),
+        use_center_hysteresis=(
+            not args.smooth_center and not args.center_passthrough
+        ),
+        center_passthrough=bool(args.center_passthrough),
+        center_deadzone_px=float(args.center_deadzone_px),
+        center_window=int(args.center_window),
+        center_k_of_n=int(args.center_k_of_n),
+        center_tau=float(args.center_tau),
     )
     compute_stable_bbox(image_dir, output, cfg)
     return 0

@@ -33,8 +33,32 @@ Optional flags:
   --resize N             square crop size in px                (default 512)
   --with-albedo          run IntrinsicAnything for albedo GT   (default off)
   --no-stable-bbox       skip the stable bbox preprocess step  (default on)
+  --no-prescale          skip ffmpeg short-side rescaling      (default on)
+                         When prescale is on, frames are extracted at
+                         short-side = --resize before bbox is computed,
+                         normalising the apparent face size across input
+                         video resolutions. Disable only when your custom
+                         intrinsics are already pinned to the original
+                         video resolution.
   --bbox-verify          also write bbox_verify.mp4 + .csv     (default off)
   --bbox-cutoff-hz F     FIR LPF cutoff in Hz for bbox.size    (default 2.5)
+  --bbox-scale F         INNER stable_bbox scale factor (passed
+                         to stable_bbox.py --scale). Default 1.6;
+                         legacy was 1.4. Sets the SMIRK / DECA
+                         224-crop margin around the K-of-N
+                         hysteresis center anchor. Independent
+                         of --outer-bbox-scale.
+  --outer-bbox-scale F   OUTER fixed-crop bbox scale (passed to
+                         crop_and_matting.py --bbox_scale).
+                         Inflation factor applied to the video-
+                         wide face union bbox to size the
+                         per-video fixed outer crop. Default 2.2
+                         (crop_and_matting.py default).
+  --bbox-center-deadzone-px F  K-of-N deadzone in px           (default 4.0)
+  --bbox-center-window N       K-of-N window length            (default 5)
+  --bbox-center-k-of-n N       K-of-N threshold                (default 3)
+  --bbox-center-tau F          Center follower tau in seconds  (default 0.25)
+  --bbox-center-passthrough    bypass FIR + hysteresis on center (default off)
   --lambda-shape F       DECA optimize.py shape regularizer    (default 1e-2,
                          the original HRAvatar fork value. Pass 1.0-5.0 to
                          fix alien-looking enlarged head / collapsed face in
@@ -72,8 +96,16 @@ FPS=30
 RESIZE=512
 WITH_ALBEDO=0
 STABLE_BBOX=1
+NO_PRESCALE=0
 BBOX_VERIFY=0
 BBOX_CUTOFF_HZ=2.5
+BBOX_SCALE=""
+OUTER_BBOX_SCALE=""
+BBOX_CENTER_DEADZONE_PX=""
+BBOX_CENTER_WINDOW=""
+BBOX_CENTER_K_OF_N=""
+BBOX_CENTER_TAU=""
+BBOX_CENTER_PASSTHROUGH=0
 LAMBDA_SHAPE=""
 LAMBDA_EXP=""
 SKIP_DECA_PATCHES=0
@@ -98,8 +130,16 @@ while [[ $# -gt 0 ]]; do
     --resize)          require_value "$@"; RESIZE="$2"; shift 2 ;;
     --with-albedo|--with_albedo) WITH_ALBEDO=1; shift ;;
     --no-stable-bbox)  STABLE_BBOX=0; shift ;;
+    --no-prescale)     NO_PRESCALE=1; shift ;;
     --bbox-verify)     BBOX_VERIFY=1; shift ;;
     --bbox-cutoff-hz)  require_value "$@"; BBOX_CUTOFF_HZ="$2"; shift 2 ;;
+    --bbox-scale)               require_value "$@"; BBOX_SCALE="$2"; shift 2 ;;
+    --outer-bbox-scale)         require_value "$@"; OUTER_BBOX_SCALE="$2"; shift 2 ;;
+    --bbox-center-deadzone-px)  require_value "$@"; BBOX_CENTER_DEADZONE_PX="$2"; shift 2 ;;
+    --bbox-center-window)       require_value "$@"; BBOX_CENTER_WINDOW="$2"; shift 2 ;;
+    --bbox-center-k-of-n)       require_value "$@"; BBOX_CENTER_K_OF_N="$2"; shift 2 ;;
+    --bbox-center-tau)          require_value "$@"; BBOX_CENTER_TAU="$2"; shift 2 ;;
+    --bbox-center-passthrough)  BBOX_CENTER_PASSTHROUGH=1; shift ;;
     --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
     --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
     --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
@@ -151,16 +191,44 @@ if [[ ! -f "${DATA_DIR}/${NAME}.mp4" ]]; then
 fi
 
 echo "[preprocess 1/5] crop + matting"
+CROP_EXTRA_ARGS=()
+if [[ "${NO_PRESCALE}" == "1" ]]; then
+  CROP_EXTRA_ARGS+=(--no_prescale)
+fi
+if [[ -n "${OUTER_BBOX_SCALE}" ]]; then
+  CROP_EXTRA_ARGS+=(--bbox_scale "${OUTER_BBOX_SCALE}")
+fi
 python preprocess/crop_and_matting.py \
     --source "${ROOT}" --name "${NAME}" --fps "${FPS}" \
     --image_size "${RESIZE}" "${RESIZE}" \
-    --matting --crop_image --mask_clothes True
+    --matting --crop_image --mask_clothes True \
+    ${CROP_EXTRA_ARGS[@]+"${CROP_EXTRA_ARGS[@]}"}
 
 DECA_PRECOMPUTED_BBOX_ARG=""
 if [[ "${STABLE_BBOX}" == "1" ]]; then
   echo "[preprocess 1.5/5] stable bbox (FlashAvatar PR#7 port)"
+  STABLE_BBOX_EXTRA_ARGS=()
+  if [[ -n "${BBOX_SCALE}" ]]; then
+    STABLE_BBOX_EXTRA_ARGS+=(--scale "${BBOX_SCALE}")
+  fi
+  if [[ -n "${BBOX_CENTER_DEADZONE_PX}" ]]; then
+    STABLE_BBOX_EXTRA_ARGS+=(--center_deadzone_px "${BBOX_CENTER_DEADZONE_PX}")
+  fi
+  if [[ -n "${BBOX_CENTER_WINDOW}" ]]; then
+    STABLE_BBOX_EXTRA_ARGS+=(--center_window "${BBOX_CENTER_WINDOW}")
+  fi
+  if [[ -n "${BBOX_CENTER_K_OF_N}" ]]; then
+    STABLE_BBOX_EXTRA_ARGS+=(--center_k_of_n "${BBOX_CENTER_K_OF_N}")
+  fi
+  if [[ -n "${BBOX_CENTER_TAU}" ]]; then
+    STABLE_BBOX_EXTRA_ARGS+=(--center_tau "${BBOX_CENTER_TAU}")
+  fi
+  if [[ "${BBOX_CENTER_PASSTHROUGH}" == "1" ]]; then
+    STABLE_BBOX_EXTRA_ARGS+=(--center_passthrough)
+  fi
   python preprocess/stable_bbox.py \
-      --source "${DATA_DIR}" --fps "${FPS}" --cutoff_hz "${BBOX_CUTOFF_HZ}"
+      --source "${DATA_DIR}" --fps "${FPS}" --cutoff_hz "${BBOX_CUTOFF_HZ}" \
+      ${STABLE_BBOX_EXTRA_ARGS[@]+"${STABLE_BBOX_EXTRA_ARGS[@]}"}
   if [[ "${BBOX_VERIFY}" == "1" ]]; then
     echo "[preprocess 1.5b] bbox verify mp4"
     python preprocess/bbox_verify.py \
