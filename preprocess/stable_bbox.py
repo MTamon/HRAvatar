@@ -344,10 +344,28 @@ def _list_frames(image_dir: Path) -> list[Path]:
 
 def compute_stable_bbox(
     image_dir: Path, output_path: Path, cfg: StableBboxConfig,
+    coord_system: str = 'outer_512',
 ) -> dict:
     """Two-pass bbox stabilization. Returns a dict with the arrays for use
     by callers that want the result in-memory; also persists `output_path`
-    (npz) and `output_path.with_suffix('.meta.json')`."""
+    (npz) and `output_path.with_suffix('.meta.json')`.
+
+    `coord_system` records which image coordinate system the resulting
+    `tform` is expressed in:
+
+    - ``"outer_512"`` (default, legacy): tform is in the outer-cropped 512x512
+      image coordinate system. Consumers warp ``image/`` (post outer crop)
+      with ``tform.inverse``.
+    - ``"raw"``: tform is in the prescaled (image_raw/) coordinate system,
+      *before* the outer crop. Consumers warp ``image_raw/`` with
+      ``tform.inverse`` to get a 224 face crop at the higher-resolution
+      raw face. Used by SMIRK encoder when the data_loader detects a
+      separate ``stable_bbox_raw.npz`` and ``image_raw/`` directory.
+
+    The string is persisted in both the npz (as a 0-d array) and the JSON
+    meta sidecar so consumers can branch correctly without re-deriving the
+    coordinate system from the image_dir path.
+    """
     image_dir = Path(image_dir)
     output_path = Path(output_path)
     frames = _list_frames(image_dir)
@@ -456,12 +474,16 @@ def compute_stable_bbox(
         # `passthrough` or `smooth_center`.
         target_center=target_centers,
         motion_flag=motion_flags,
+        # Coordinate system marker — readers branch on this. 0-d str array.
+        coord_system=np.array(coord_system),
     )
 
     meta = asdict(cfg)
     meta['taps'] = taps
     meta['n_frames'] = int(len(frames))
     meta['n_detected'] = int(detected_arr.sum())
+    meta['coord_system'] = coord_system
+    meta['source_image_dir'] = str(image_dir.name)
     meta_path = output_path.with_suffix('.meta.json')
     meta_path.write_text(json.dumps(meta, indent=2))
 
@@ -482,8 +504,23 @@ def compute_stable_bbox(
     }
 
 
-def _resolve_image_dir(source: Path) -> Path:
-    """`crop_and_matting.py` writes to either `image/` or `images/`."""
+def _resolve_image_dir(source: Path, preferred: str | None = None) -> Path:
+    """Locate the source image directory under `source`.
+
+    When `preferred` is set it's resolved first (and must exist & be
+    non-empty). With no preference the lookup falls back to the legacy
+    `image/` -> `images/` order; the new two-tier layout's `image_raw/`
+    is *not* picked up automatically (callers running stable_bbox on raw
+    must pass `--source-image-dir image_raw` explicitly so the coord
+    system mismatch can't slip through silently).
+    """
+    if preferred is not None:
+        c = source / preferred
+        if c.is_dir() and any(c.iterdir()):
+            return c
+        raise FileNotFoundError(
+            f'requested --source-image-dir={preferred!r} not found / empty '
+            f'under {source}')
     candidates = [source / 'image', source / 'images']
     for c in candidates:
         if c.is_dir() and any(c.iterdir()):
@@ -545,11 +582,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--output', type=str, default=None,
                         help='Output npz path. Defaults to '
                              '<source>/stable_bbox.npz.')
+    parser.add_argument('--source_image_dir', type=str, default=None,
+                        help='Image subdirectory under <source> to read '
+                             'frames from (e.g. `image_raw` for the new '
+                             'two-tier layout, `image` for the legacy '
+                             'outer-cropped 512 layout). When unset, falls '
+                             'back to the legacy `image/` then `images/` '
+                             'lookup.')
+    parser.add_argument('--coord_system', type=str, default=None,
+                        choices=['raw', 'outer_512'],
+                        help='Coordinate system the resulting tform is '
+                             'expressed in. When unset, inferred from '
+                             '--source_image_dir (`image_raw` -> raw, '
+                             'anything else -> outer_512). Persisted into '
+                             'the npz so data_loader.py / DECA can branch '
+                             'between SMIRK-on-raw and DECA-on-outer_512.')
     args = parser.parse_args(argv)
 
     source = Path(args.source).resolve()
-    image_dir = _resolve_image_dir(source)
+    image_dir = _resolve_image_dir(source, preferred=args.source_image_dir)
     output = Path(args.output) if args.output else source / 'stable_bbox.npz'
+
+    if args.coord_system is not None:
+        coord_system = args.coord_system
+    elif image_dir.name == 'image_raw':
+        coord_system = 'raw'
+    else:
+        coord_system = 'outer_512'
 
     cfg = StableBboxConfig(
         fps=float(args.fps),
@@ -571,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         center_k_of_n=int(args.center_k_of_n),
         center_tau=float(args.center_tau),
     )
-    compute_stable_bbox(image_dir, output, cfg)
+    compute_stable_bbox(image_dir, output, cfg, coord_system=coord_system)
     return 0
 
 

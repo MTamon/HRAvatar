@@ -109,17 +109,53 @@ class TrackedData(torch.utils.data.Dataset):
         self.imagepath_list=imagepath_list
         self.data_len=len(imagepath_list)
         
-        # Per-frame SMIRK input crop. Two paths:
-        #   (1) `stable_bbox.npz` exists at the dataset root → load the
-        #       precomputed (basename → tform) mapping. Skip MediaPipe at
-        #       training time entirely; same crop as DECA preprocessing saw.
+        # Per-frame SMIRK input crop. Three paths in priority order:
+        #   (0) `stable_bbox_raw.npz` (coord_system="raw") + `image_raw/` →
+        #       load the raw-coord (basename → tform) mapping and warp the
+        #       prescaled (image_raw/) frame directly. SMIRK encoder sees
+        #       the face at the prescale resolution rather than the
+        #       outer-cropped 512 (which can shrink the face when the head
+        #       motion envelope is wide). HRAvatar training image
+        #       (`original_image`) stays on `image/` to keep the intrinsics
+        #       preset's coord system intact.
+        #   (1) `stable_bbox.npz` (coord_system="outer_512" or unmarked) →
+        #       load the precomputed (basename → tform) mapping. Skip
+        #       MediaPipe at training time entirely; same crop as DECA
+        #       preprocessing saw on the outer-cropped 512.
         #   (2) Otherwise → fall back to legacy per-iter MediaPipe + crop_face.
-        # Path (1) eliminates the mouth/blink leak into the SMIRK encoder
-        # input that is the dominant source of expression-channel jitter.
+        # Paths (0)/(1) both eliminate the mouth/blink leak into the SMIRK
+        # encoder input that is the dominant source of expression-channel
+        # jitter. (0) additionally preserves face resolution.
         self._stable_bbox_tforms: dict[str, np.ndarray] | None = None
+        self._stable_bbox_raw_tforms: dict[str, np.ndarray] | None = None
+        self._image_raw_dir: str | None = None
         if args.with_param_net_smirk:
+            stable_bbox_raw_path = os.path.join(path, 'stable_bbox_raw.npz')
+            image_raw_dir_path = os.path.join(path, 'image_raw')
+            if (os.path.exists(stable_bbox_raw_path)
+                    and os.path.isdir(image_raw_dir_path)
+                    and any(os.scandir(image_raw_dir_path))):
+                npz_raw = np.load(stable_bbox_raw_path, allow_pickle=False)
+                coord_raw = (str(npz_raw['coord_system'])
+                             if 'coord_system' in npz_raw.files else 'unknown')
+                if coord_raw != 'raw':
+                    print(f'[data_loader] {stable_bbox_raw_path} '
+                          f'coord_system={coord_raw!r}; expected "raw"; '
+                          f'falling back to outer_512 / MediaPipe path.')
+                else:
+                    names_raw = [str(b) for b in npz_raw['frame_basenames']]
+                    tforms_raw = npz_raw['tform']
+                    self._stable_bbox_raw_tforms = {
+                        name: tforms_raw[i] for i, name in enumerate(names_raw)
+                    }
+                    self._image_raw_dir = image_raw_dir_path
+                    print(f'[data_loader] using raw-resolution SMIRK warp '
+                          f'({len(self._stable_bbox_raw_tforms)} frames) '
+                          f'from {stable_bbox_raw_path} + {image_raw_dir_path}')
+
             stable_bbox_path = os.path.join(path, 'stable_bbox.npz')
-            if os.path.exists(stable_bbox_path):
+            if (self._stable_bbox_raw_tforms is None
+                    and os.path.exists(stable_bbox_path)):
                 npz = np.load(stable_bbox_path, allow_pickle=False)
                 names = [str(b) for b in npz['frame_basenames']]
                 tforms = npz['tform']
@@ -129,7 +165,7 @@ class TrackedData(torch.utils.data.Dataset):
                 print(f'[data_loader] using precomputed stable bbox '
                       f'({len(self._stable_bbox_tforms)} frames) from '
                       f'{stable_bbox_path}')
-            else:
+            elif self._stable_bbox_raw_tforms is None:
                 from mediapipe.tasks import python
                 from mediapipe.tasks.python import vision
                 base_options = python.BaseOptions(model_asset_path='./assets/smirk/face_landmarker.task')
@@ -267,7 +303,29 @@ class TrackedData(torch.utils.data.Dataset):
         warped_image=None
         crop_size=[224,224]
         if args.with_param_net_smirk:
-            if self._stable_bbox_tforms is not None:
+            if self._stable_bbox_raw_tforms is not None:
+                # Two-tier path: SMIRK warp source is image_raw/ (prescale
+                # resolution, before outer crop). The tform is in raw
+                # coordinates so it operates on the raw image directly.
+                # FLAME translation_code stays single-source-of-truth —
+                # we only switch the SMIRK encoder's input pixel grid;
+                # head pose / camera intrinsics are unchanged.
+                tform_params = self._stable_bbox_raw_tforms.get(image_basename)
+                if tform_params is None:
+                    raise KeyError(
+                        f'stable_bbox_raw.npz has no entry for '
+                        f'{image_basename}; regenerate it with '
+                        f'preprocess/stable_bbox.py --source_image_dir '
+                        f'image_raw after changing image_raw/.')
+                tform = SimilarityTransform(matrix=tform_params)
+                raw_image_path = os.path.join(self._image_raw_dir, image_basename)
+                raw_image = Image.open(raw_image_path).convert('RGB')
+                raw_image_array = np.array(raw_image, dtype=np.float32) / 255.0
+                warped_image = warp(
+                    raw_image_array, tform.inverse,
+                    output_shape=(224, 224), preserve_range=True,
+                )
+            elif self._stable_bbox_tforms is not None:
                 # Precomputed path: look up the stabilized similarity transform
                 # by source-image basename and warp directly. No MediaPipe at
                 # training time — same (center, size) DECA preprocessing saw.
@@ -278,6 +336,7 @@ class TrackedData(torch.utils.data.Dataset):
                         f'regenerate it with preprocess/stable_bbox.py after '
                         f'changing image/.')
                 tform = SimilarityTransform(matrix=tform_params)
+                warped_image = warp(image, tform.inverse, output_shape=(224, 224), preserve_range=True)
             else:
                 kpt_mediapipe = run_mediapipe((image*255.0).astype(np.uint8),self.detector)
                 if (kpt_mediapipe is None):
@@ -287,7 +346,7 @@ class TrackedData(torch.utils.data.Dataset):
                     kpt_mediapipe = kpt_mediapipe[..., :2]
                     landmark=kpt_mediapipe
                 tform = crop_face(image,kpt_mediapipe,scale=1.4,image_size=224)
-            warped_image = warp(image, tform.inverse, output_shape=(224, 224), preserve_range=True)
+                warped_image = warp(image, tform.inverse, output_shape=(224, 224), preserve_range=True)
             warped_image=torch.tensor(warped_image, device=self.device,dtype=torch.float32)
             warped_image=warped_image.permute(2, 0, 1)[None]
             # warped_kpt_mediapipe = np.dot(tform.params, np.hstack([kpt_mediapipe, np.ones([kpt_mediapipe.shape[0],1])]).T).T

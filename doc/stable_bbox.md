@@ -292,6 +292,62 @@ union を 2.2 倍 (調整可) にそれぞれ拡大します。
   そのまま渡すと prescale を有効にした瞬間に整合性が崩れます。
   `--no-prescale` を併用すれば原寸基準のまま動かせます。
 
+## resize と顔絶対 px・SMIRK 解像度の関係
+
+`crop_and_matting.py` の前段は ffmpeg で **prescale (短辺正規化)** をかけ、
+その後 outer 512 crop が走ります。この 2 段は CLI で **独立に**
+制御できます:
+
+| フラグ (demo) | 渡し先 (`crop_and_matting.py`) | 既定値 | 役割 |
+|---|---|---|---|
+| `--resize` | `--prescale_short_side` | `720` | ffmpeg prescale 短辺 (px)。bbox / SMIRK / DECA が見る顔絶対 px を決める。 |
+| `--image-size` | `--image_size N N` | `512` | outer crop 後画像の正方サイズ (px)。`scene/data_loader.py` が `original_image` として読む。intrinsics プリセット (cx=cy=256, fx=fy=1536 など) と一致させる必要があるため、通常 512 固定。 |
+
+設計の意図は「**bbox 段階の顔絶対 px** と **outer crop 後の出力画像サイズ**
+を切り離す」ことです:
+
+- `--resize` を上げると、ffmpeg 抽出フレームが大きくなる
+  → outer crop に与える原画も大きい → outer crop 内側の **顔絶対 px** が増える
+  → `stable_bbox.py` の MediaPipe 入力解像度が上がり、`tform`/`scale=1.6`
+  で計算される 224 crop の元領域が広く取れる → SMIRK encoder が **より
+  高解像度の顔** を見る。
+- `--image-size` は outer crop 出力の最終解像度。intrinsics プリセットの
+  `cx, cy, fx, fy` がこの値前提で書かれているため、**変える場合は
+  intrinsics も併せて再計算する**こと。
+
+`MK6cD` (`--resize=512`) と `MK6cJ` (`--resize=512` + outer crop の顔縮小)
+で観測された再構成品質低下は、bbox 段階の顔絶対 px が約 21% 縮小したこと
+で SMIRK / DECA の有効解像度が下がったのが主因です。`--resize 720`
+(default) に上げると bbox 段階の顔絶対 px が回復します。
+
+`--resize` を上げると ffmpeg 抽出 png の disk 使用量も増える点に注意
+(720 短辺・5846 frame で約 9 GB)。outer crop 後の `image/` 容量は
+`--image-size` 由来なので変わりません。
+
+## image_raw + image 二段ディレクトリ (SMIRK encoder 高解像度経路)
+
+`crop_and_matting.py` の処理は **2 段の出力ディレクトリ** に分かれます:
+
+| ディレクトリ | 内容 | 用途 |
+|---|---|---|
+| `image_raw/` | ffmpeg prescale 後 (短辺 = `--prescale_short_side`)、outer crop **前** の原フレーム | SMIRK encoder の warp 元 (raw 解像度の高い顔)、stable_bbox 計算 (raw 座標系) |
+| `image/` | outer crop 後 `--image_size` 正方画像 | HRAvatar 学習の `original_image`、DECA 入力、stable_bbox 計算 (outer_512 座標系) |
+| `outer_offset.json` | `{x_min, y_min, outer_size, image_size, source_image_dir, source_width, source_height}` | raw → outer_512 への intrinsics 変換に使う (将来の拡張用、現状の data_loader / DECA は未使用) |
+
+**処理順 (`_preprocess_subject.sh` 経由)**:
+
+1. `crop_and_matting.py --stage all` → `image_raw/` + `image/` + `outer_offset.json` を生成
+2. `stable_bbox.py --source_image_dir image` → `stable_bbox.npz` (`coord_system="outer_512"`)、DECA `--precomputed-bbox` が消費
+3. `image_raw/` がある場合: `stable_bbox.py --source_image_dir image_raw --output stable_bbox_raw.npz` → `stable_bbox_raw.npz` (`coord_system="raw"`)、HRAvatar 学習の SMIRK warp が消費
+4. DECA reconstruct + optimize は **`image/` + `stable_bbox.npz` (outer_512)** で動く (現状通り)
+5. 学習: `scene/data_loader.py` が `stable_bbox_raw.npz` + `image_raw/` の存在を検出すると、**SMIRK warp 元画像を `image_raw/` に切り替え** (HRAvatar の `original_image` は引き続き `image/` の 512x512)
+
+**memory 制約との整合**: `image_raw/` 経路では SMIRK encoder への入力 pixel grid だけが切り替わり、FLAME translation_code・camera intrinsics・gaussians 投影行列はすべて outer_512 (= `image/` 座標系) のまま。head motion は引き続き FLAME translation で一元管理されます。
+
+**後方互換**: `image_raw/` が無い既存 subject では `stable_bbox_raw.npz` も生成されず、`data_loader.py` は従来の outer_512 経路 (`image/` + `stable_bbox.npz`) で動きます。再前処理せずに既存 subject の挙動は変わりません。
+
+**`--coord_system` メタ**: `stable_bbox.py` は npz と JSON sidecar の両方に `coord_system` (= `"raw"` or `"outer_512"`) を埋め込みます。古い npz (これより前に生成されたもの) には `coord_system` キーが無いので、`data_loader.py` は不在時 `outer_512` として扱います (既存挙動)。
+
 ## 既知の制限
 
 - **MediaPipe が初フレームで顔を検出できる必要があります**。先頭が後ろ

@@ -30,7 +30,18 @@ Required arguments:
 
 Optional flags:
   --fps N                frame extraction fps                  (default 30)
-  --resize N             square crop size in px                (default 512)
+  --resize N             ffmpeg prescale short-side in px      (default 720)
+                         Sets the short-side resolution of frames written by
+                         the ffmpeg extract step BEFORE the outer crop runs.
+                         A higher value gives SMIRK / DECA more face pixels
+                         at the bbox / tracking stage. Independent of
+                         --image-size (which controls the outer-crop output
+                         size that feeds HRAvatar training).
+  --image-size N         outer-crop output square size in px   (default 512)
+                         The bbox stage produces an image of this size that
+                         the downstream camera intrinsics preset is pinned
+                         to. Do NOT change unless you also rebuild the
+                         intrinsics preset for the new resolution.
   --with-albedo          run IntrinsicAnything for albedo GT   (default off)
   --no-stable-bbox       skip the stable bbox preprocess step  (default on)
   --no-prescale          skip ffmpeg short-side rescaling      (default on)
@@ -93,7 +104,8 @@ NAME=""
 VIDEO=""
 INTRINSICS=""
 FPS=30
-RESIZE=512
+RESIZE=720
+IMAGE_SIZE=512
 WITH_ALBEDO=0
 STABLE_BBOX=1
 NO_PRESCALE=0
@@ -128,6 +140,7 @@ while [[ $# -gt 0 ]]; do
     --intrinsics)      require_value "$@"; INTRINSICS="$2"; shift 2 ;;
     --fps)             require_value "$@"; FPS="$2"; shift 2 ;;
     --resize)          require_value "$@"; RESIZE="$2"; shift 2 ;;
+    --image-size|--image_size) require_value "$@"; IMAGE_SIZE="$2"; shift 2 ;;
     --with-albedo|--with_albedo) WITH_ALBEDO=1; shift ;;
     --no-stable-bbox)  STABLE_BBOX=0; shift ;;
     --no-prescale)     NO_PRESCALE=1; shift ;;
@@ -200,7 +213,8 @@ if [[ -n "${OUTER_BBOX_SCALE}" ]]; then
 fi
 python preprocess/crop_and_matting.py \
     --source "${ROOT}" --name "${NAME}" --fps "${FPS}" \
-    --image_size "${RESIZE}" "${RESIZE}" \
+    --image_size "${IMAGE_SIZE}" "${IMAGE_SIZE}" \
+    --prescale_short_side "${RESIZE}" \
     --matting --crop_image --mask_clothes True \
     ${CROP_EXTRA_ARGS[@]+"${CROP_EXTRA_ARGS[@]}"}
 
@@ -226,13 +240,28 @@ if [[ "${STABLE_BBOX}" == "1" ]]; then
   if [[ "${BBOX_CENTER_PASSTHROUGH}" == "1" ]]; then
     STABLE_BBOX_EXTRA_ARGS+=(--center_passthrough)
   fi
+  # 1) outer_512 stable_bbox.npz — DECA --precomputed-bbox consumes this
+  #    (DECA stays on image/ at the outer-cropped resolution).
   python preprocess/stable_bbox.py \
       --source "${DATA_DIR}" --fps "${FPS}" --cutoff_hz "${BBOX_CUTOFF_HZ}" \
+      --source_image_dir image \
       ${STABLE_BBOX_EXTRA_ARGS[@]+"${STABLE_BBOX_EXTRA_ARGS[@]}"}
   if [[ "${BBOX_VERIFY}" == "1" ]]; then
     echo "[preprocess 1.5b] bbox verify mp4"
     python preprocess/bbox_verify.py \
         --source "${DATA_DIR}" --fps "${FPS}"
+  fi
+  # 2) raw-coord stable_bbox_raw.npz — HRAvatar's data_loader auto-detects
+  #    this file plus image_raw/ and switches the SMIRK encoder warp
+  #    source to the prescale-resolution face. Skipped silently when
+  #    image_raw/ is absent (legacy single-tier datasets).
+  if [[ -d "${DATA_DIR}/image_raw" ]]; then
+    echo "[preprocess 1.5c] stable bbox on image_raw (SMIRK raw-resolution path)"
+    python preprocess/stable_bbox.py \
+        --source "${DATA_DIR}" --fps "${FPS}" --cutoff_hz "${BBOX_CUTOFF_HZ}" \
+        --source_image_dir image_raw \
+        --output "${DATA_DIR}/stable_bbox_raw.npz" \
+        ${STABLE_BBOX_EXTRA_ARGS[@]+"${STABLE_BBOX_EXTRA_ARGS[@]}"}
   fi
   # The DECA fork patched by tools/patches/apply_deca_stable_bbox.py accepts
   # `--precomputed-bbox`. Without the patch the flag is unknown and DECA
@@ -269,7 +298,7 @@ if [[ -n "${LAMBDA_EXP}" ]]; then
 fi
 ( cd "${DECA_DIR}" && \
   python optimize.py --path "${DATA_DIR}" \
-      --cx "${CX}" --cy "${CY}" --fx "${FX}" --fy "${FY}" --size "${RESIZE}" \
+      --cx "${CX}" --cy "${CY}" --fx "${FX}" --fy "${FY}" --size "${IMAGE_SIZE}" \
       --n_shape 100 --n_expr 100 --with_translation \
       ${DECA_OPTIMIZE_EXTRA_ARGS[@]+"${DECA_OPTIMIZE_EXTRA_ARGS[@]}"} )
 

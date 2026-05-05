@@ -20,7 +20,16 @@
 #
 # Optional flags:
 #   --fps N              frame-rate for frame extraction (default 30)
-#   --resize N           square crop size (default 512)
+#   --resize N           ffmpeg prescale short-side in px (default 720).
+#                        Sets the short-side resolution of frames written
+#                        before the outer crop. A higher value gives SMIRK /
+#                        DECA more face pixels at the bbox / tracking stage.
+#                        Independent of --image-size.
+#   --image-size N       outer-crop output square size in px (default 512).
+#                        The bbox stage produces an image of this size that
+#                        the downstream camera intrinsics preset is pinned
+#                        to. Do NOT change unless the intrinsics preset is
+#                        rebuilt for the new resolution.
 #   --epochs N           training epochs (default 15)
 #   --with-albedo        run IntrinsicAnything for albedo pseudo-GT
 #   --skip-preprocess    skip preprocessing (already done)
@@ -58,7 +67,8 @@
 # Environment overrides still accepted for backward compatibility:
 #   CUDA_VISIBLE_DEVICES  (default 0)
 #   FPS                   frame-rate for frame extraction (default 30)
-#   RESIZE                square crop size (default 512)
+#   RESIZE                ffmpeg prescale short-side in px (default 720)
+#   IMAGE_SIZE            outer-crop output square size in px (default 512)
 #   EPOCHS                training epochs (default 15)
 #   WITH_ALBEDO=1         run IntrinsicAnything for albedo pseudo-GT
 #   SKIP_PREPROCESS=1     skip preprocessing (already done)
@@ -85,7 +95,8 @@ INTRINSICS=""
 # was retired to avoid residual / typo risk; we still accept the env-var
 # inputs here for backward compatibility with existing automation).
 : "${FPS:=30}"
-: "${RESIZE:=512}"
+: "${RESIZE:=720}"
+: "${IMAGE_SIZE:=512}"
 : "${WITH_ALBEDO:=0}"
 : "${BBOX_VERIFY:=0}"
 : "${NO_PRESCALE:=0}"
@@ -124,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --intrinsics)      require_value "$@"; INTRINSICS="$2"; shift 2 ;;
     --fps)             require_value "$@"; FPS="$2"; shift 2 ;;
     --resize)          require_value "$@"; RESIZE="$2"; shift 2 ;;
+    --image-size|--image_size) require_value "$@"; IMAGE_SIZE="$2"; shift 2 ;;
     --epochs)          require_value "$@"; EPOCHS="$2"; shift 2 ;;
     --with-albedo|--with_albedo) WITH_ALBEDO=1; shift ;;
     --skip-preprocess) SKIP_PREPROCESS=1; shift ;;
@@ -175,7 +187,7 @@ DATA_DIR="${ROOT}/${NAME}"
 MODEL_DIR="${REPO_ROOT}/outputs/custom/${NAME}"
 
 if [[ "${SKIP_PREPROCESS}" != "1" ]]; then
-  PREPROCESS_FLAGS=(--fps "${FPS}" --resize "${RESIZE}")
+  PREPROCESS_FLAGS=(--fps "${FPS}" --resize "${RESIZE}" --image-size "${IMAGE_SIZE}")
   if [[ "${WITH_ALBEDO}" == "1" ]]; then
     PREPROCESS_FLAGS+=(--with-albedo)
   fi

@@ -4,6 +4,7 @@ from abc import ABC
 from glob import glob
 from pathlib import Path
 import argparse
+import json
 import cv2
 from tqdm import tqdm
 import face_alignment
@@ -88,14 +89,30 @@ class Crop_and_matting(Dataset, ABC):
         self.name = args.name
         self.source = Path(source, args.name)
         os.makedirs(self.source,exist_ok=True)
+        # `image_raw/` holds prescale-after / outer-crop-before frames.
+        # `image/` holds outer-crop-after 512 frames (HRAvatar training input).
+        # Two-tier layout decouples SMIRK / DECA encoder resolution (which can
+        # consume `image_raw/`) from the outer-crop output that intrinsics
+        # presets are pinned to (`image/`). FLAME translation stays single-
+        # source-of-truth: head motion is encoded as FLAME translation_code,
+        # NOT split across crop offsets / sidecar / virtual cameras.
+        self.image_path = Path(self.source, 'image')
+        self.image_raw_path = Path(self.source, 'image_raw')
+        self.outer_offset_path = Path(self.source, 'outer_offset.json')
+        self.stage = getattr(args, 'stage', 'all')
         self.initialize()
         self.face_detector = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device=self.device)
-    
-    def initialize(self):
-        self.image_path = Path(self.source,'image')
-        image_path=self.image_path
 
-        if not image_path.exists() or len(os.listdir(str(image_path))) == 0:
+    def initialize(self):
+        # Output the prescaled (but not outer-cropped) frames to `image_raw/`.
+        # Legacy callers that invoked this script expecting frames at `image/`
+        # (the only output dir before the two-tier layout) still get them
+        # written to `image/` by the outer-crop stage below; `image_raw/` is
+        # additive.
+        image_raw_path = self.image_raw_path
+        self.image_path_for_extract = image_raw_path
+
+        if not image_raw_path.exists() or len(os.listdir(str(image_raw_path))) == 0:
             #video_file = self.source / 'video.mp4'
             # video_files = glob(os.path.join(self.source, '*.mp4'))
             video_file=os.path.join(self.source_dir, self.name,f'{self.name}.mp4')
@@ -107,15 +124,24 @@ class Crop_and_matting(Dataset, ABC):
             if not os.path.exists(video_file):
                 logger.error(f'[ImagesDataset] Neither images nor a video was provided! Execution has stopped! {video_file}')
                 exit(1)
-            image_path.mkdir(parents=True, exist_ok=True)
+            image_raw_path.mkdir(parents=True, exist_ok=True)
 
-            # Prescale to short_side = image_size before extracting frames.
-            # Without this step the bbox stage (which inherits the source-
-            # video resolution) makes the absolute face px size depend on
-            # the input video's resolution, making the same `bb_scale` look
-            # too tight on 1080p input and too loose on 360p input. Use
-            # `-2` to preserve the aspect ratio while keeping dims even.
-            target = int(self.config.image_size[0])
+            # Prescale to short_side = (prescale_short_side or image_size[0])
+            # before extracting frames. Without this step the bbox stage
+            # (which inherits the source-video resolution) makes the absolute
+            # face px size depend on the input video's resolution, making the
+            # same `bb_scale` look too tight on 1080p input and too loose on
+            # 360p input. Use `-2` to preserve aspect ratio with even dims.
+            #
+            # NOTE: --prescale_short_side decouples the bbox-stage input
+            # resolution (face absolute px) from the outer-crop output size
+            # (--image_size). Pass a higher --prescale_short_side (e.g. 720)
+            # to give SMIRK / DECA more pixels of face while keeping the
+            # outer-crop output at the resolution required by the intrinsics
+            # preset (typically 512). Default falls back to --image_size[0]
+            # for backward compatibility.
+            prescale_target = getattr(self.config, 'prescale_short_side', None)
+            target = int(prescale_target) if prescale_target else int(self.config.image_size[0])
             no_prescale = bool(getattr(self.config, 'no_prescale', False))
             if no_prescale:
                 vf = f'fps={self.config.fps}'
@@ -124,9 +150,9 @@ class Crop_and_matting(Dataset, ABC):
                     f"scale='if(gt(iw,ih),-2,{target})':"
                     f"'if(gt(iw,ih),{target},-2)',fps={self.config.fps}"
                 )
-            os.system(f'ffmpeg -i {video_file} -vf "{vf}" -start_number 0 -q:v 1 {image_path}/%05d.png')#%05d
+            os.system(f'ffmpeg -i {video_file} -vf "{vf}" -start_number 0 -q:v 1 {image_raw_path}/%05d.png')#%05d
 
-        self.images = sorted(glob(f'{image_path}/*.jpg') + glob(f'{image_path}/*.png'),key=natural_sort_key)
+        self.images = sorted(glob(f'{image_raw_path}/*.jpg') + glob(f'{image_raw_path}/*.png'),key=natural_sort_key)
 
     def process_face(self, image):
         lmks, scores, detected_faces = self.face_detector.get_landmarks_from_image(image, return_landmark_score=True, return_bboxes=True)
@@ -297,6 +323,16 @@ class Crop_and_matting(Dataset, ABC):
         return np.array([xb_min, xb_max, yb_min, yb_max])
 
     def run(self):
+        # Two-stage entry point. Stages:
+        #   `extract`     — initialize() already wrote prescale frames to
+        #                   image_raw/. Nothing more to do.
+        #   `outer-crop`  — read image_raw/, write outer-cropped 512x512 to
+        #                   image/, persist outer_offset.json, run matting.
+        #   `all` (def.)  — extract + outer-crop in one invocation.
+        if self.stage == 'extract':
+            logger.info('crop_and_matting --stage=extract: image_raw/ ready, '
+                        'skipping outer crop / matting.')
+            return
 
         logger.info('Croping dataset (video-wide fixed outer bbox)...')
         cfg = self.config
@@ -304,6 +340,46 @@ class Crop_and_matting(Dataset, ABC):
         logger.info(
             f'video-wide outer bbox (xmin,xmax,ymin,ymax)={bbox.tolist()}')
 
+        # Persist the outer-crop offset / size in raw coordinates so that
+        # downstream consumers (data_loader, DECA optimize) can transform
+        # raw-coordinate quantities (intrinsics, tform) into the outer_512
+        # coordinate system without re-deriving the bbox. The intrinsics
+        # remap is:
+        #   cx_512 = (cx_raw - x_min) * (image_size / outer_size)
+        #   fx_512 = fx_raw * (image_size / outer_size)
+        # Outer crop is video-wide fixed (one bbox per video), so a single
+        # offset record suffices for every frame — FLAME translation_code
+        # stays the single source of truth for head motion.
+        outer_x_min = int(bbox[0])
+        outer_y_min = int(bbox[2])
+        outer_x_max = int(bbox[1])
+        outer_y_max = int(bbox[3])
+        outer_size = int(max(outer_x_max - outer_x_min,
+                             outer_y_max - outer_y_min))
+        # Reference frame size of `image_raw/` (the coordinate system bbox/
+        # tform values are expressed in). All raw frames have identical
+        # dims because ffmpeg prescaled them to the same short side.
+        first_img = cv2.imread(self.images[0])
+        raw_h, raw_w = first_img.shape[:2]
+        out_image_size = int(cfg.image_size[0])
+        outer_offset = {
+            'x_min': outer_x_min,
+            'y_min': outer_y_min,
+            'x_max': outer_x_max,
+            'y_max': outer_y_max,
+            'outer_size': outer_size,
+            'image_size': out_image_size,
+            'source_image_dir': 'image_raw',
+            'source_width': int(raw_w),
+            'source_height': int(raw_h),
+        }
+        self.outer_offset_path.write_text(json.dumps(outer_offset, indent=2))
+        logger.info(f'wrote {self.outer_offset_path}')
+
+        # Outer crop reads from image_raw/ and writes outer-cropped 512x512
+        # to image/. image_raw/ is preserved for SMIRK / DECA at higher
+        # resolution.
+        self.image_path.mkdir(parents=True, exist_ok=True)
         for imagepath in tqdm(self.images, desc='outer_crop'):
             image = cv2.imread(imagepath)
             if cfg.crop_range is not None:
@@ -320,7 +396,8 @@ class Crop_and_matting(Dataset, ABC):
                     interpolation=cv2.INTER_CUBIC,
                 )
 
-            cv2.imwrite(imagepath, image)
+            out_path = os.path.join(str(self.image_path), os.path.basename(imagepath))
+            cv2.imwrite(out_path, image)
 
         if self.config.matting:
             logger.info("Matting dataset...")
@@ -329,14 +406,14 @@ class Crop_and_matting(Dataset, ABC):
             save_seg_path=os.path.join(self.source,"seg")
             os.makedirs(save_mask_path,exist_ok=True)
             self.robust_video_matting(self.image_path,save_mask_path)
-            
-            
+
+
             self.face_parsing(self.image_path,save_seg_path)
             self.merge_maks(self.image_path,save_mask_path,save_seg_path)
             shutil.rmtree(save_mask_path)
             shutil.rmtree(save_seg_path)
         logger.info("Done!")
-        
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Crop and matting dataset')
@@ -352,12 +429,34 @@ if __name__ == '__main__':
     parser.add_argument("--no_prescale", action='store_true',
                         help='Skip the short-side prescale during ffmpeg '
                              'extraction. Default behaviour scales the input '
-                             'video so its short side equals --image_size '
-                             'before frames are written, normalising the '
-                             'apparent face size across input resolutions. '
-                             'Set this when the input video already has the '
-                             'expected short-side resolution AND the camera '
-                             'intrinsics passed downstream are pinned to it.')
+                             'video so its short side equals '
+                             '--prescale_short_side (or --image_size[0] if '
+                             'unset) before frames are written, normalising '
+                             'the apparent face size across input '
+                             'resolutions. Set this when the input video '
+                             'already has the expected short-side resolution '
+                             'AND the camera intrinsics passed downstream '
+                             'are pinned to it.')
+    parser.add_argument("--prescale_short_side", type=int, default=None,
+                        help='ffmpeg short-side prescale target (px). When '
+                             'unset, falls back to --image_size[0] (legacy '
+                             'behaviour, prescale and outer-crop output share '
+                             'the same size). Set this to e.g. 720 to give '
+                             'SMIRK / DECA more face pixels at the bbox / '
+                             'tracking stage while keeping the outer-crop '
+                             'output at --image_size (typically 512 to match '
+                             'the downstream intrinsics preset).')
+    parser.add_argument("--stage", type=str,
+                        choices=['extract', 'outer-crop', 'all'],
+                        default='all',
+                        help='Pipeline stage to run. `extract` only writes '
+                             'prescaled frames to image_raw/ (so an external '
+                             'step — e.g. stable_bbox.py on raw — can run '
+                             'before outer crop). `outer-crop` reads from an '
+                             'existing image_raw/ and writes outer-cropped '
+                             '512x512 frames to image/ plus matting + '
+                             'outer_offset.json. `all` (default) runs both '
+                             'in one invocation, matching legacy behaviour.')
 
     args=parser.parse_args(sys.argv[1:])
     crop_and_matting = Crop_and_matting(args.source, args)

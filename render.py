@@ -172,29 +172,61 @@ def render_set(model_path, name, epoch, cam_params, gaussians, pipeline, backgro
     rendering_imgs = np.stack(rendering_imgs, 0).transpose(0, 2, 3, 1)
     imageio.mimwrite(os.path.join(vedio_path, f'{name}_{scene_name}_video.mp4'), rendering_imgs, fps=30, quality=8)
 
+def _cuda_sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _fps_safe(seconds_per_image):
+    return (1.0 / seconds_per_image) if seconds_per_image > 0 else float("inf")
+
+
+def _format_speed_summary(label, total_s, params_s):
+    pure_s = total_s - params_s
+    return (
+        f"[{label}] total: {total_s*1000:.2f} ms/img ({_fps_safe(total_s):.1f} FPS) | "
+        f"params_extract: {params_s*1000:.2f} ms ({_fps_safe(params_s):.1f} FPS) | "
+        f"pure_render: {pure_s*1000:.2f} ms ({_fps_safe(pure_s):.1f} FPS)"
+    )
+
+
 def test_rendering_speed(model_path, cam_params, gaussians, pipeline, background,args):
     import copy,time,json
     render=gaussian_renderer.render_with_deferred
-    
+
     savefolder=model_path
     speed_dict={}
     print("test rendering speed.......")
     cam_params=copy.deepcopy(cam_params)
     test_length=500
     test_cam_params=cam_params[:test_length]
+
+    # Warm-up render to amortise lazy CUDA init / first-launch overhead, then
+    # synchronise so its cost is not folded into the timed loop.
     rendering_results = render(cam_params[-1], gaussians, pipeline, background)
+    _cuda_sync()
+
+    # Single synchronise straddling the loop: we measure the wall time of the
+    # whole 500-iter render, not per-iter (per-iter sync inflates the cost).
+    # NOTE: gaussians.params_extract_time is recorded inside forward() without
+    # a CUDA sync, so it reflects CPU dispatch time of the SMIRK encoder, not
+    # its true GPU runtime. The authoritative number here is total_speed.
+    _cuda_sync()
     start_time=time.time()
     params_extract_time=0
     for idx in tqdm(range(test_length)):
         rendering_results = render(test_cam_params[idx], gaussians, pipeline, background)
         params_extract_time+=gaussians.params_extract_time
+    _cuda_sync()
     end_time=time.time()
     avg_total_speed=(end_time-start_time)/test_length
     avg_params_extract_speed=(params_extract_time)/test_length
-    speed_dict["total_speed"]={"times(ms/image)":avg_total_speed*1000,"FPS(images/s)":1.0/avg_total_speed}
-    speed_dict["params_extract_speed"]={"times(ms/image)":avg_params_extract_speed*1000,"FPS(images/s)":1.0/avg_params_extract_speed}
-    speed_dict["rendering_speed"]={"times(ms/image)":(avg_total_speed-avg_params_extract_speed)*1000,"FPS(images/s)":1.0/(avg_total_speed-avg_params_extract_speed)}
-    
+    pure_render_speed=avg_total_speed-avg_params_extract_speed
+    speed_dict["total_speed"]={"times(ms/image)":avg_total_speed*1000,"FPS(images/s)":_fps_safe(avg_total_speed)}
+    speed_dict["params_extract_speed"]={"times(ms/image)":avg_params_extract_speed*1000,"FPS(images/s)":_fps_safe(avg_params_extract_speed)}
+    speed_dict["rendering_speed"]={"times(ms/image)":pure_render_speed*1000,"FPS(images/s)":_fps_safe(pure_render_speed)}
+
+    print(_format_speed_summary("default", avg_total_speed, avg_params_extract_speed))
 
 
     if len(args.envmap_path)!=0:
@@ -202,20 +234,26 @@ def test_rendering_speed(model_path, cam_params, gaussians, pipeline, background
         envpath=args.envmap_path[0]
         new_Envmap=EnvironmentMap_relight(envpath)
         rendering_results = render(test_cam_params[-1], gaussians, pipeline, background,other_envmap=new_Envmap)
+        _cuda_sync()
         params_extract_time=0
+        _cuda_sync()
         start_time=time.time()
         for idx in tqdm(range(test_length)):
             cam_param=test_cam_params[idx]
             rendering_results = render(cam_param, gaussians, pipeline, background,other_envmap=new_Envmap)
             rendering=rendering_results["render"]
             params_extract_time+=gaussians.params_extract_time
+        _cuda_sync()
         end_time=time.time()
         avg_total_speed=(end_time-start_time)/test_length
         avg_params_extract_speed=(params_extract_time)/test_length
+        pure_render_speed=avg_total_speed-avg_params_extract_speed
 
-        speed_dict["religting_total_speed"]={"times(ms/image)":avg_total_speed*1000,"FPS(images/s)":1.0/avg_total_speed}
-        speed_dict["religting_params_extract_speed"]={"times(ms/image)":avg_params_extract_speed*1000,"FPS(images/s)":1.0/avg_params_extract_speed}
-        speed_dict["religting_rendering_speed"]={"times(ms/image)":(avg_total_speed-avg_params_extract_speed)*1000,"FPS(images/s)":1.0/(avg_total_speed-avg_params_extract_speed)}
+        speed_dict["religting_total_speed"]={"times(ms/image)":avg_total_speed*1000,"FPS(images/s)":_fps_safe(avg_total_speed)}
+        speed_dict["religting_params_extract_speed"]={"times(ms/image)":avg_params_extract_speed*1000,"FPS(images/s)":_fps_safe(avg_params_extract_speed)}
+        speed_dict["religting_rendering_speed"]={"times(ms/image)":pure_render_speed*1000,"FPS(images/s)":_fps_safe(pure_render_speed)}
+
+        print(_format_speed_summary("relight", avg_total_speed, avg_params_extract_speed))
 
     with open(os.path.join(savefolder, "rendering_speed" + '.json'), 'w') as fp:
         json.dump(speed_dict, fp)
@@ -535,6 +573,12 @@ def render_sets(dataset_args : ModelParams, epoch : int, pipeline : PipelinePara
 
         test_rendering_speed(dataset_args.model_path, train_dataset, gaussians, pipeline, background,all_args)
 
+        # Standalone speed-measurement mode: skip every other render path so
+        # the user only pays for the timing run + JSON output.
+        if getattr(all_args, "test_rendering_speed", False):
+            gaussians.set_eval(False)
+            return
+
         # Install SMIRK output smoother once; reset between independent sequences.
         smirk_smoother = _maybe_attach_smirk_smoother(gaussians, all_args)
 
@@ -623,6 +667,9 @@ if __name__ == "__main__":
     parser.add_argument("--train_static_material_edting_idxs", nargs="+",type=int,default=[])
     parser.add_argument("--source_params_path",type=str,default="")
     parser.add_argument("--with_relight_background",action="store_true",default=False)
+    parser.add_argument("--test_rendering_speed", action="store_true", default=False,
+                        help="Run the rendering-speed measurement only, then exit. "
+                             "Writes <model_path>/rendering_speed.json and prints a one-line summary.")
     parser=add_more_argument(parser)
     args = get_combined_args(parser,model)
 
