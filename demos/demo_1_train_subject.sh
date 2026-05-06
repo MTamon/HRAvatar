@@ -63,6 +63,10 @@
 #                        (causal). Implies --jitter-filter.
 #   --jitter-filter-min-cutoff F  One-Euro min_cutoff Hz (default 1.0)
 #   --jitter-filter-beta F        One-Euro beta (default 0.0)
+#   --masked-loss        train with foreground-weighted L1+SSIM (off by default)
+#   --mask-bg-weight F   bg/fg loss weight ratio when --masked-loss is set
+#                        (1.0 = vanilla, 0.1 = default, 0.0 = mask-only)
+#   --lambda-image F     scale image_loss vs other loss terms (default 1.0)
 #
 # Environment overrides still accepted for backward compatibility:
 #   CUDA_VISIBLE_DEVICES  (default 0)
@@ -115,6 +119,9 @@ INTRINSICS=""
 : "${JITTER_FILTER_SMIRK:=0}"
 : "${JITTER_FILTER_MIN_CUTOFF:=}"
 : "${JITTER_FILTER_BETA:=}"
+: "${MASKED_LOSS:=0}"
+: "${MASK_BG_WEIGHT:=}"
+: "${LAMBDA_IMAGE:=}"
 export CUDA_VISIBLE_DEVICES
 
 POSITIONAL=()
@@ -156,6 +163,9 @@ while [[ $# -gt 0 ]]; do
     --jitter-filter-smirk)      JITTER_FILTER=1; JITTER_FILTER_SMIRK=1; shift ;;
     --jitter-filter-min-cutoff) require_value "$@"; JITTER_FILTER_MIN_CUTOFF="$2"; shift 2 ;;
     --jitter-filter-beta)       require_value "$@"; JITTER_FILTER_BETA="$2"; shift 2 ;;
+    --masked-loss|--masked_loss) MASKED_LOSS=1; shift ;;
+    --mask-bg-weight|--mask_bg_weight) require_value "$@"; MASK_BG_WEIGHT="$2"; shift 2 ;;
+    --lambda-image|--lambda_image)     require_value "$@"; LAMBDA_IMAGE="$2"; shift 2 ;;
     -h|--help)         usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -251,6 +261,15 @@ if [[ "${JITTER_FILTER}" == "1" ]]; then
   if [[ -n "${JITTER_FILTER_BETA}" ]]; then
     TRAIN_EXTRA_ARGS+=(--jitter_filter_beta "${JITTER_FILTER_BETA}")
   fi
+fi
+if [[ "${MASKED_LOSS}" == "1" ]]; then
+  TRAIN_EXTRA_ARGS+=(--masked_loss)
+fi
+if [[ -n "${MASK_BG_WEIGHT}" ]]; then
+  TRAIN_EXTRA_ARGS+=(--mask_bg_weight "${MASK_BG_WEIGHT}")
+fi
+if [[ -n "${LAMBDA_IMAGE}" ]]; then
+  TRAIN_EXTRA_ARGS+=(--lambda_image "${LAMBDA_IMAGE}")
 fi
 
 python train.py \

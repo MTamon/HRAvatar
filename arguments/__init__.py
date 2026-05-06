@@ -139,7 +139,11 @@ class OptimizationParams(ParamGroup):
         self.with_depth_supervise=True
         self.with_intrinsic_supervise=True
         self.detach_normal_refer=False
-        
+
+        self.masked_loss=False
+        self.mask_bg_weight=0.1
+        self.lambda_image=1.0
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser,model=None):

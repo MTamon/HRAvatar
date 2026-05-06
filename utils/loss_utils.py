@@ -20,6 +20,42 @@ def l1_loss(network_output, gt):
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
+def masked_l1_loss(network_output, gt, mask, bg_weight=0.1):
+    # Foreground/background-weighted L1, normalized by weight.mean() so the
+    # absolute loss scale matches vanilla l1_loss (= diff.mean()). Without
+    # this normalization, image_loss shrinks while other lambda_* terms keep
+    # their absolute scale, indirectly inflating their relative influence.
+    weight = mask + (1.0 - mask) * bg_weight
+    diff = (network_output - gt).abs()
+    return (diff * weight).mean() / weight.mean().clamp(min=1e-6)
+
+def masked_ssim(img1, img2, mask, window_size=11, bg_weight=0.1):
+    # Same fg/bg weighting as masked_l1_loss applied to the SSIM map.
+    # No mask dilation: the soft alpha mask naturally smooths across the
+    # boundary, and the bg_weight floor preserves boundary monitoring.
+    channel = img1.size(-3)
+    window = create_window(window_size, channel)
+    if img1.is_cuda:
+        window = window.cuda(img1.get_device())
+    window = window.type_as(img1)
+
+    squeeze_back = (img1.dim() == 3)
+    img1_b = img1.unsqueeze(0) if squeeze_back else img1
+    img2_b = img2.unsqueeze(0) if squeeze_back else img2
+
+    mu1 = F.conv2d(img1_b, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(img2_b, window, padding=window_size // 2, groups=channel)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+    sigma1_sq = F.conv2d(img1_b * img1_b, window, padding=window_size // 2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2_b * img2_b, window, padding=window_size // 2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1_b * img2_b, window, padding=window_size // 2, groups=channel) - mu1_mu2
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    mask_b = mask.unsqueeze(0) if mask.dim() == 3 else mask
+    weight = mask_b + (1.0 - mask_b) * bg_weight
+    return (ssim_map * weight).mean() / weight.mean().clamp(min=1e-6)
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()

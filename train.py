@@ -3,7 +3,7 @@
 import os,logging,time,sys,uuid,shutil,copy
 import torch,torchvision
 from random import randint
-from utils.loss_utils import l1_loss, ssim,l2_loss,TVloss
+from utils.loss_utils import l1_loss, ssim,l2_loss,TVloss,masked_l1_loss,masked_ssim
 
 from gaussian_renderer import network_gui
 import gaussian_renderer
@@ -117,10 +117,15 @@ def training(all_args, testing_epochs, saving_epochs, checkpoint_epochs, checkpo
         # Loss
         loss=0.0
         
-        Ll1 = l1_loss(image, gt_image)
-        image_loss = (1.0 - all_args.lambda_dssim) * Ll1 + all_args.lambda_dssim * (1.0 - ssim(image, gt_image))
+        if getattr(all_args, "masked_loss", False):
+            bg_w = getattr(all_args, "mask_bg_weight", 0.1)
+            Ll1 = masked_l1_loss(image, gt_image, gt_alpha_mask, bg_weight=bg_w)
+            image_loss = (1.0 - all_args.lambda_dssim) * Ll1 + all_args.lambda_dssim * (1.0 - masked_ssim(image, gt_image, gt_alpha_mask, bg_weight=bg_w))
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            image_loss = (1.0 - all_args.lambda_dssim) * Ll1 + all_args.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-        loss+=image_loss
+        loss+=getattr(all_args, "lambda_image", 1.0) * image_loss
         cam_o=viewpoint_cam_param.camera_center.cuda(device)
         
         
