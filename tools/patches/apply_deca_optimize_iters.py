@@ -1,4 +1,4 @@
-"""Add configurable iter caps + early-stop to DECA's ``optimize.py`` (idempotent).
+"""Add configurable iter caps + iris-only early-stop to DECA's ``optimize.py`` (idempotent).
 
 Why
 ---
@@ -7,17 +7,23 @@ refinement loop for a hardcoded ``1000`` iterations and the iris-only
 refinement for ``500``, with no early-stop / plateau detection. Inspection
 of typical training-video logs shows the iris loss is usually flat from
 ~iter 300 onwards (4th-decimal noise), so the last 200 iris iters are
-pure waste; the main loop tends to keep improving but at a diminishing
-rate that depends on the input.
+pure waste.
+
+The main loop is left WITHOUT early-stop on purpose: empirically it can
+keep refining beyond a 100-iter plateau, and inputs that look converged
+early sometimes rebound. We only expose ``--max_iters`` to cap it (default
+1000 = original behaviour) so users can extend it if needed; the rel-tol
+short-circuit applies only to the iris loop.
 
 This patcher exposes four CLI args on ``optimize.py``:
 
-* ``--max_iters`` (default 1000) - hard cap for the main optimize loop.
+* ``--max_iters`` (default 1000) - hard cap for the main optimize loop
+  (no early-stop; runs to the cap).
 * ``--max_iris_iters`` (default 500) - hard cap for the iris loop.
 * ``--early_stop_rel_tol`` (default 0.0 = disabled) - relative-improvement
-  tolerance on ``landmark_loss``, sampled every 100 iters.
+  tolerance on ``landmark_loss``, sampled every 100 iters. **Iris loop only.**
 * ``--early_stop_patience`` (default 2) - consecutive 100-iter windows
-  without a tolerated improvement before breaking.
+  without a tolerated improvement before breaking the iris loop.
 
 Defaults preserve the original HRAvatar fork behaviour exactly. The
 short-circuit only fires when the caller opts in via
@@ -58,58 +64,18 @@ MARKER = '# HRAVATAR_OPTIMIZE_ITERS'
 #
 #     for k in range(1,1001):
 #
-# We hoist the iter count into a local bound by ``args.max_iters`` and
-# initialise the early-stop bookkeeping right above the loop header so the
-# break condition (Edit 2) can refer to it.
+# We hoist the iter count into a local bound by ``args.max_iters``. No
+# early-stop bookkeeping is initialised here on purpose; the main loop
+# always runs to the cap (see module docstring for rationale).
 
 MAIN_RANGE_OLD = '        for k in range(1,1001):'
 MAIN_RANGE_NEW = (
     f'        _HRAV_MAIN_ITERS = args.max_iters  {MARKER}\n'
-    f'        _HRAV_BEST_LOSS = float(\'inf\')  {MARKER}\n'
-    f'        _HRAV_BAD_WINDOWS = 0  {MARKER}\n'
     f'        for k in range(1, _HRAV_MAIN_ITERS + 1):  {MARKER}'
 )
 
 
-# --- Edit 2: early-stop on plateau in main loop ----------------------------
-#
-# Inserted just after ``avg_lmk_loss+=landmark_loss2.item()`` (line 222) and
-# before the ``# visualize`` block. The rel-tol check only runs every 100
-# iters (matching the existing logging cadence) so the GPU sync cost is
-# zero - landmark_loss2.item() is already called on every iter at line 222.
-
-MAIN_EARLYSTOP_OLD = (
-    '            opt_p.zero_grad()\n'
-    '            total_loss.backward()\n'
-    '            opt_p.step()\n'
-    '            avg_lmk_loss+=landmark_loss2.item()\n'
-    '            # visualize\n'
-    '            if k % 100 == 0:'
-)
-MAIN_EARLYSTOP_NEW = (
-    '            opt_p.zero_grad()\n'
-    '            total_loss.backward()\n'
-    '            opt_p.step()\n'
-    '            avg_lmk_loss+=landmark_loss2.item()\n'
-    f'            {MARKER} BEGIN: early-stop on plateau (main loop)\n'
-    '            if args.early_stop_rel_tol > 0 and k % 100 == 0:\n'
-    '                _hrav_cur = landmark_loss2.item()\n'
-    '                if _hrav_cur < _HRAV_BEST_LOSS * (1.0 - args.early_stop_rel_tol):\n'
-    '                    _HRAV_BEST_LOSS = _hrav_cur\n'
-    '                    _HRAV_BAD_WINDOWS = 0\n'
-    '                else:\n'
-    '                    _HRAV_BAD_WINDOWS += 1\n'
-    '                    if _HRAV_BAD_WINDOWS >= args.early_stop_patience:\n'
-    '                        print(f\'[early-stop] main optimize plateau at iter={k} \'\n'
-    '                              f\'(best={_HRAV_BEST_LOSS:.6f}, cur={_hrav_cur:.6f})\')\n'
-    '                        break\n'
-    f'            {MARKER} END\n'
-    '            # visualize\n'
-    '            if k % 100 == 0:'
-)
-
-
-# --- Edit 3: cap the iris loop iter count via args.max_iris_iters ----------
+# --- Edit 2: cap the iris loop iter count via args.max_iris_iters ----------
 #
 # Mirror of Edit 1 for the iris-only refinement at optimize.py line 296.
 
@@ -122,11 +88,12 @@ IRIS_RANGE_NEW = (
 )
 
 
-# --- Edit 4: early-stop on plateau in iris loop ----------------------------
+# --- Edit 3: early-stop on plateau in iris loop ----------------------------
 #
-# Mirror of Edit 2 with bookkeeping vars suffixed _IRIS to avoid collisions
-# with the main loop (which has already finished by this point but the
-# bound names persist on the method's stack frame).
+# Inserted just after ``avg_lmk_loss+=landmark_loss2.item()`` in the iris
+# loop (matching the existing logging cadence). Bookkeeping vars are
+# suffixed _IRIS for clarity even though the main loop no longer defines
+# the unsuffixed counterparts.
 
 IRIS_EARLYSTOP_OLD = (
     '                opt_p.zero_grad()\n'
@@ -159,7 +126,7 @@ IRIS_EARLYSTOP_NEW = (
 )
 
 
-# --- Edit 5: add CLI args to argparse --------------------------------------
+# --- Edit 4: add CLI args to argparse --------------------------------------
 #
 # Anchor: ``args = parser.parse_args()`` (unique, last line of the
 # argparse setup block). We insert immediately *before* this line so the
@@ -177,13 +144,14 @@ ARGPARSE_PAYLOAD = (
     "                    help='Max iterations for the iris-only optimize loop. '\n"
     "                         'Default 500 matches the original HRAvatar fork.')\n"
     "parser.add_argument('--early_stop_rel_tol', type=float, default=0.0,\n"
-    "                    help='Plateau tolerance on landmark_loss (checked every '\n"
-    "                         '100 iter). 0.0 disables early-stop. 0.005-0.01 is '\n"
-    "                         'typical when opting in.')\n"
+    "                    help='Plateau tolerance on landmark_loss for the '\n"
+    "                         'IRIS-ONLY loop (checked every 100 iter). 0.0 '\n"
+    "                         'disables. 0.005-0.01 typical. The main loop is '\n"
+    "                         'NOT early-stopped (must run full --max_iters).')\n"
     "parser.add_argument('--early_stop_patience', type=int, default=2,\n"
     "                    help='Consecutive 100-iter windows without rel_tol '\n"
-    "                         'improvement before breaking. Only used if '\n"
-    "                         'early_stop_rel_tol > 0.')\n"
+    "                         'improvement before breaking the iris loop. '\n"
+    "                         'Only used if early_stop_rel_tol > 0.')\n"
     f'{MARKER} END\n'
 )
 
@@ -215,7 +183,6 @@ def _reindent(payload: str, indent: str) -> str:
 
 _ANCHORS = (
     ('main range', MAIN_RANGE_OLD),
-    ('main early-stop', MAIN_EARLYSTOP_OLD),
     ('iris range', IRIS_RANGE_OLD),
     ('iris early-stop', IRIS_EARLYSTOP_OLD),
     ('argparse anchor', ARGPARSE_ANCHOR),
@@ -223,7 +190,7 @@ _ANCHORS = (
 
 
 def patch_optimize(optimize_py: Path) -> bool:
-    """Apply all five edits to optimize.py. Returns True iff the file was changed."""
+    """Apply all four edits to optimize.py. Returns True iff the file was changed."""
     text = optimize_py.read_text()
     if MARKER in text:
         print(f'[skip] {optimize_py} already patched ({MARKER} present)')
@@ -237,7 +204,6 @@ def patch_optimize(optimize_py: Path) -> bool:
                 f'        DECA fork may have drifted. Re-base or hand-merge.\n'
                 f'        Anchor head: {anchor.splitlines()[0]!r}')
 
-    text = text.replace(MAIN_EARLYSTOP_OLD, MAIN_EARLYSTOP_NEW, 1)
     text = text.replace(MAIN_RANGE_OLD, MAIN_RANGE_NEW, 1)
     text = text.replace(IRIS_EARLYSTOP_OLD, IRIS_EARLYSTOP_NEW, 1)
     text = text.replace(IRIS_RANGE_OLD, IRIS_RANGE_NEW, 1)

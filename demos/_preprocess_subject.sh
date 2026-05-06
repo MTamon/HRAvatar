@@ -2,6 +2,16 @@
 # -----------------------------------------------------------------------------
 # Internal helper: run HRAvatar's preprocessing pipeline on a subject.
 #
+# Scope
+# -----
+# This script produces ``tracked_params.json`` for HRAvatar AVATAR PERSONAL FIT
+# (one-time), via DECA's full-clip joint Adam optimization. It is NOT the
+# right entry point for Listening Head Generation (LHG) teacher data: the
+# clip-wide joint optimization here cannot be reproduced at online
+# inference, so using these outputs as LHG targets makes the model learn
+# behaviour that breaks at runtime. For LHG features use
+# ``demos/extract_lhg_features.sh`` (see ``doc/preprocessing_scope.md``).
+#
 # All tunables are CLI flags (not env vars) so a single invocation cannot
 # silently inherit residual state from the surrounding shell. Run with
 # --help for the full list. The only env var honoured is
@@ -76,14 +86,18 @@ Optional flags:
                          optimize_vis.jpg. Requires DECA optimize patcher.)
   --lambda-exp F         DECA optimize.py exp regularizer      (default 1e-2)
   --max-iters N          DECA optimize.py main-loop iter cap   (default 1000,
-                         the original HRAvatar fork value. Lower to short-
-                         circuit the slow tail of the photometric refinement.
+                         the original HRAvatar fork value. The main loop is
+                         NOT early-stopped; if you want it shorter, lower
+                         this cap. Empirically the loss can keep refining
+                         past 100-iter plateaus.
                          Requires apply_deca_optimize_iters.py.)
   --max-iris-iters N     DECA optimize.py iris-loop iter cap   (default 500)
-  --early-stop-rel-tol F Plateau tolerance on landmark_loss   (default 0.0=off,
-                         checked every 100 iter. 0.005-0.01 typical when on.)
+  --early-stop-rel-tol F Plateau tolerance on landmark_loss for the
+                         IRIS loop ONLY                        (default 0.0=off,
+                         checked every 100 iter. 0.005-0.01 typical when on.
+                         Has no effect on the main loop.)
   --early-stop-patience N Consecutive 100-iter windows below   (default 2)
-                         rel_tol before breaking.
+                         rel_tol before breaking the iris loop.
   --main-lr F            DECA optimize.py main-loop initial Adam lr (default
                          1e-2 = original HRAvatar fork). Affects pose/exp/
                          shape only; eyelid/translation lrs untouched.
