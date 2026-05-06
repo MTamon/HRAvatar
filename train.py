@@ -118,7 +118,7 @@ def training(all_args, testing_epochs, saving_epochs, checkpoint_epochs, checkpo
         loss=0.0
         
         if getattr(all_args, "masked_loss", False):
-            bg_w = getattr(all_args, "mask_bg_weight", 0.1)
+            bg_w = getattr(all_args, "mask_bg_weight", 1.0)
             Ll1 = masked_l1_loss(image, gt_image, gt_alpha_mask, bg_weight=bg_w)
             image_loss = (1.0 - all_args.lambda_dssim) * Ll1 + all_args.lambda_dssim * (1.0 - masked_ssim(image, gt_image, gt_alpha_mask, bg_weight=bg_w))
         else:

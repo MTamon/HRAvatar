@@ -141,7 +141,7 @@ class OptimizationParams(ParamGroup):
         self.detach_normal_refer=False
 
         self.masked_loss=False
-        self.mask_bg_weight=0.1
+        self.mask_bg_weight=1.0
         self.lambda_image=1.0
 
         super().__init__(parser, "Optimization Parameters")

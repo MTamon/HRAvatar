@@ -71,6 +71,17 @@ bash demos/demo_1_train_subject.sh \
 
 出力は `outputs/custom/<subject_name>/` に保存されます。
 
+現状のベストプラクティスは以下のコマンド
+```bash
+bash demos/demo_1_train_subject.sh \
+    --sbj-root /data/subjects \
+    --sbj-name MK6cOpt \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf \
+    --jitter-filter --jitter-filter-smirk \
+    --masked-loss --mask-bg-weight 1.0 --lambda-image 1.2
+```
+
 ## 2. オフライン cross-reenactment
 
 `demos/demo_2_cross_reenactment.sh`
