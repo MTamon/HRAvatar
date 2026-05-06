@@ -79,7 +79,8 @@ bash demos/demo_1_train_subject.sh \
     --video /data/raw/alice.mp4 \
     --intrinsics hdtf \
     --jitter-filter --jitter-filter-smirk \
-    --masked-loss --mask-bg-weight 1.0 --lambda-image 1.2
+    --resize 720 --image-size 512 \
+    --lambda-image 1.2
 ```
 
 ## 2. オフライン cross-reenactment
