@@ -55,6 +55,24 @@
 #                        if optimize_vis.jpg shows alien-looking enlarged
 #                        head / collapsed face. See doc/deca_patches.md.
 #   --lambda-exp F       DECA optimize.py expression regularizer (default 1e-2)
+#   --max-iters N        DECA optimize.py main-loop iter cap (default 1000 =
+#                        original HRAvatar fork). Lower to short-circuit the
+#                        slow tail of the per-frame photometric refinement.
+#                        Requires apply_deca_optimize_iters.py.
+#   --max-iris-iters N   DECA optimize.py iris-loop iter cap (default 500)
+#   --early-stop-rel-tol F  Plateau tolerance on landmark_loss in DECA optimize
+#                           (default 0.0 = disabled). Sampled every 100 iter.
+#                           0.005-0.01 is typical when opting in.
+#   --early-stop-patience N Consecutive 100-iter windows without rel_tol
+#                           improvement before breaking (default 2)
+#   --main-lr F          DECA optimize.py main-loop initial Adam lr (default
+#                        1e-2 = original HRAvatar fork). Affects pose/exp/
+#                        shape only; eyelid/translation lrs untouched.
+#                        Requires apply_deca_optimize_lr.py.
+#   --main-lr-decay-step N  Apply lr decay every N iter of the main loop
+#                           (default 0 = off). Multiplicative on every
+#                           param group (per-group ratios preserved).
+#   --main-lr-decay-factor F  Multiplier per decay step (default 0.5)
 #   --skip-deca-patches  do NOT auto-apply tools/patches/apply_deca_*.py (default off)
 #   --jitter-filter      enable One-Euro temporal smoothing of tracker params
 #                        at train+render time. Default OFF. See
@@ -113,6 +131,13 @@ INTRINSICS=""
 : "${BBOX_CENTER_PASSTHROUGH:=0}"
 : "${LAMBDA_SHAPE:=}"
 : "${LAMBDA_EXP:=}"
+: "${MAX_ITERS:=}"
+: "${MAX_IRIS_ITERS:=}"
+: "${EARLY_STOP_REL_TOL:=}"
+: "${EARLY_STOP_PATIENCE:=}"
+: "${MAIN_LR:=}"
+: "${MAIN_LR_DECAY_STEP:=}"
+: "${MAIN_LR_DECAY_FACTOR:=}"
 : "${SKIP_DECA_PATCHES:=0}"
 # Jitter-filter pass-through to train.py / render.py (off by default).
 : "${JITTER_FILTER:=0}"
@@ -158,6 +183,13 @@ while [[ $# -gt 0 ]]; do
     --bbox-center-passthrough)  BBOX_CENTER_PASSTHROUGH=1; shift ;;
     --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
     --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --max-iters)             require_value "$@"; MAX_ITERS="$2"; shift 2 ;;
+    --max-iris-iters)        require_value "$@"; MAX_IRIS_ITERS="$2"; shift 2 ;;
+    --early-stop-rel-tol)    require_value "$@"; EARLY_STOP_REL_TOL="$2"; shift 2 ;;
+    --early-stop-patience)   require_value "$@"; EARLY_STOP_PATIENCE="$2"; shift 2 ;;
+    --main-lr)               require_value "$@"; MAIN_LR="$2"; shift 2 ;;
+    --main-lr-decay-step)    require_value "$@"; MAIN_LR_DECAY_STEP="$2"; shift 2 ;;
+    --main-lr-decay-factor)  require_value "$@"; MAIN_LR_DECAY_FACTOR="$2"; shift 2 ;;
     --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
     --jitter-filter)            JITTER_FILTER=1; shift ;;
     --jitter-filter-smirk)      JITTER_FILTER=1; JITTER_FILTER_SMIRK=1; shift ;;
@@ -236,6 +268,27 @@ if [[ "${SKIP_PREPROCESS}" != "1" ]]; then
   fi
   if [[ -n "${LAMBDA_EXP}" ]]; then
     PREPROCESS_FLAGS+=(--lambda-exp "${LAMBDA_EXP}")
+  fi
+  if [[ -n "${MAX_ITERS}" ]]; then
+    PREPROCESS_FLAGS+=(--max-iters "${MAX_ITERS}")
+  fi
+  if [[ -n "${MAX_IRIS_ITERS}" ]]; then
+    PREPROCESS_FLAGS+=(--max-iris-iters "${MAX_IRIS_ITERS}")
+  fi
+  if [[ -n "${EARLY_STOP_REL_TOL}" ]]; then
+    PREPROCESS_FLAGS+=(--early-stop-rel-tol "${EARLY_STOP_REL_TOL}")
+  fi
+  if [[ -n "${EARLY_STOP_PATIENCE}" ]]; then
+    PREPROCESS_FLAGS+=(--early-stop-patience "${EARLY_STOP_PATIENCE}")
+  fi
+  if [[ -n "${MAIN_LR}" ]]; then
+    PREPROCESS_FLAGS+=(--main-lr "${MAIN_LR}")
+  fi
+  if [[ -n "${MAIN_LR_DECAY_STEP}" ]]; then
+    PREPROCESS_FLAGS+=(--main-lr-decay-step "${MAIN_LR_DECAY_STEP}")
+  fi
+  if [[ -n "${MAIN_LR_DECAY_FACTOR}" ]]; then
+    PREPROCESS_FLAGS+=(--main-lr-decay-factor "${MAIN_LR_DECAY_FACTOR}")
   fi
   if [[ "${SKIP_DECA_PATCHES}" == "1" ]]; then
     PREPROCESS_FLAGS+=(--skip-deca-patches)

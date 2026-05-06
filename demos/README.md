@@ -71,6 +71,45 @@ The script performs these steps:
 
 Outputs land in `outputs/custom/<subject_name>/`.
 
+The current best-practice command is:
+
+```bash
+bash demos/demo_1_train_subject.sh \
+    --sbj-root /data/subjects \
+    --sbj-name MK6cOpt \
+    --video /data/raw/alice.mp4 \
+    --intrinsics hdtf \
+    --jitter-filter --jitter-filter-smirk \
+    --resize 720 --image-size 512 \
+    --lambda-image 1.2 \
+    --early-stop-rel-tol 0.005 --early-stop-patience 2
+```
+
+The trailing `--early-stop-rel-tol 0.005 --early-stop-patience 2` opts the
+DECA `optimize.py` iris loop into early-stop. The iris loss usually plateaus
+around iter ~300, so the default 500-iter cap is mostly idle time. Adding
+these flags trims roughly 25 seconds without measurable quality loss.
+
+### Trimming DECA optimize runtime (optional)
+
+`preprocess/submodules/DECA/optimize.py` runs the main refinement
+(pose / exp / shape) for a fixed 1000 iters and the iris loop for 500,
+totalling ~3 minutes per subject. The opt-in flags below cut that down.
+See [`doc/deca_patches.md`](../doc/deca_patches.md) for the full rationale.
+
+| Use case | Flags | Expected speedup | Notes |
+|---|---|---|---|
+| Iris-only early stop (safest) | `--early-stop-rel-tol 0.005 --early-stop-patience 2` | ~-25 s | Already in the best-practice command above |
+| Bump main lr + step decay | `--main-lr 1.5e-2 --main-lr-decay-step 500 --main-lr-decay-factor 0.5 --early-stop-rel-tol 0.01 --early-stop-patience 2` | ~-50 to -70 s | Pulls the loss-curve transition forward, then halves lr for finer fitting |
+| Hard caps on the main loop | `--max-iters 800 --max-iris-iters 300` | ~-60 s | Deterministic but inspect quality (`landmark_loss` typically rises +10–15 %) |
+
+These flags require the corresponding patches to be applied once (idempotent):
+
+```bash
+python tools/patches/apply_deca_optimize_iters.py
+python tools/patches/apply_deca_optimize_lr.py
+```
+
 ## 2. Offline cross-reenactment
 
 `demos/demo_2_cross_reenactment.sh`

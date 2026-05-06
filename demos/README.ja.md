@@ -80,7 +80,32 @@ bash demos/demo_1_train_subject.sh \
     --intrinsics hdtf \
     --jitter-filter --jitter-filter-smirk \
     --resize 720 --image-size 512 \
-    --lambda-image 1.2
+    --lambda-image 1.2 \
+    --early-stop-rel-tol 0.005 --early-stop-patience 2
+```
+
+末尾の `--early-stop-rel-tol 0.005 --early-stop-patience 2` は DECA `optimize.py`
+の iris ループに早期終了を opt-in する flag です。iris の損失は通常 iter ~300 で
+plateau に入るため、デフォルト 500 iter まで走らせず ~25 秒短縮できます。品質への
+影響はほぼなく、安全に追加できます。
+
+### DECA optimize の時短化（任意）
+
+`preprocess/submodules/DECA/optimize.py` のメイン最適化（pose / exp / shape）は
+固定 1000 iter、iris は 500 iter で走り、合計 ~3 分かかります。以下の opt-in flag
+で短縮可能です。詳細は [`doc/deca_patches.md`](../doc/deca_patches.md) を参照。
+
+| 用途 | flag | 期待短縮 | 備考 |
+|---|---|---|---|
+| iris のみ早期終了（最も安全） | `--early-stop-rel-tol 0.005 --early-stop-patience 2` | ~-25 秒 | 上記ベストプラクティスに含む |
+| メイン loop の lr を昇圧 + decay | `--main-lr 1.5e-2 --main-lr-decay-step 500 --main-lr-decay-factor 0.5 --early-stop-rel-tol 0.01 --early-stop-patience 2` | ~-50〜70 秒 | 相転移を前倒し、その後 lr 半減で fine-tune 加速 |
+| メイン loop に hard cap | `--max-iters 800 --max-iris-iters 300` | ~-60 秒 | 確定的だが品質確認必須（`landmark_loss` が +10〜15% 程度上がる） |
+
+これらの flag を有効化するには、以下のパッチを 1 度だけ実行する必要があります（冪等）。
+
+```bash
+python tools/patches/apply_deca_optimize_iters.py
+python tools/patches/apply_deca_optimize_lr.py
 ```
 
 ## 2. オフライン cross-reenactment

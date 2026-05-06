@@ -75,6 +75,22 @@ Optional flags:
                          fix alien-looking enlarged head / collapsed face in
                          optimize_vis.jpg. Requires DECA optimize patcher.)
   --lambda-exp F         DECA optimize.py exp regularizer      (default 1e-2)
+  --max-iters N          DECA optimize.py main-loop iter cap   (default 1000,
+                         the original HRAvatar fork value. Lower to short-
+                         circuit the slow tail of the photometric refinement.
+                         Requires apply_deca_optimize_iters.py.)
+  --max-iris-iters N     DECA optimize.py iris-loop iter cap   (default 500)
+  --early-stop-rel-tol F Plateau tolerance on landmark_loss   (default 0.0=off,
+                         checked every 100 iter. 0.005-0.01 typical when on.)
+  --early-stop-patience N Consecutive 100-iter windows below   (default 2)
+                         rel_tol before breaking.
+  --main-lr F            DECA optimize.py main-loop initial Adam lr (default
+                         1e-2 = original HRAvatar fork). Affects pose/exp/
+                         shape only; eyelid/translation lrs untouched.
+                         Requires apply_deca_optimize_lr.py.
+  --main-lr-decay-step N Apply lr decay every N iter of the main loop
+                         (default 0 = off, multiplicative on every group)
+  --main-lr-decay-factor F  Multiplier per decay step                (default 0.5)
   --skip-deca-patches    do NOT auto-apply tools/patches/apply_deca_*.py     (default off)
   -h, --help             print this message and exit
 
@@ -120,6 +136,13 @@ BBOX_CENTER_TAU=""
 BBOX_CENTER_PASSTHROUGH=0
 LAMBDA_SHAPE=""
 LAMBDA_EXP=""
+MAX_ITERS=""
+MAX_IRIS_ITERS=""
+EARLY_STOP_REL_TOL=""
+EARLY_STOP_PATIENCE=""
+MAIN_LR=""
+MAIN_LR_DECAY_STEP=""
+MAIN_LR_DECAY_FACTOR=""
 SKIP_DECA_PATCHES=0
 
 POSITIONAL=()
@@ -155,6 +178,13 @@ while [[ $# -gt 0 ]]; do
     --bbox-center-passthrough)  BBOX_CENTER_PASSTHROUGH=1; shift ;;
     --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
     --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --max-iters)             require_value "$@"; MAX_ITERS="$2"; shift 2 ;;
+    --max-iris-iters)        require_value "$@"; MAX_IRIS_ITERS="$2"; shift 2 ;;
+    --early-stop-rel-tol)    require_value "$@"; EARLY_STOP_REL_TOL="$2"; shift 2 ;;
+    --early-stop-patience)   require_value "$@"; EARLY_STOP_PATIENCE="$2"; shift 2 ;;
+    --main-lr)               require_value "$@"; MAIN_LR="$2"; shift 2 ;;
+    --main-lr-decay-step)    require_value "$@"; MAIN_LR_DECAY_STEP="$2"; shift 2 ;;
+    --main-lr-decay-factor)  require_value "$@"; MAIN_LR_DECAY_FACTOR="$2"; shift 2 ;;
     --skip-deca-patches) SKIP_DECA_PATCHES=1; shift ;;
     -h|--help)         usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
@@ -295,6 +325,27 @@ if [[ -n "${LAMBDA_SHAPE}" ]]; then
 fi
 if [[ -n "${LAMBDA_EXP}" ]]; then
   DECA_OPTIMIZE_EXTRA_ARGS+=(--lambda_exp "${LAMBDA_EXP}")
+fi
+if [[ -n "${MAX_ITERS}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--max_iters "${MAX_ITERS}")
+fi
+if [[ -n "${MAX_IRIS_ITERS}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--max_iris_iters "${MAX_IRIS_ITERS}")
+fi
+if [[ -n "${EARLY_STOP_REL_TOL}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--early_stop_rel_tol "${EARLY_STOP_REL_TOL}")
+fi
+if [[ -n "${EARLY_STOP_PATIENCE}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--early_stop_patience "${EARLY_STOP_PATIENCE}")
+fi
+if [[ -n "${MAIN_LR}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--main_lr "${MAIN_LR}")
+fi
+if [[ -n "${MAIN_LR_DECAY_STEP}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--main_lr_decay_step "${MAIN_LR_DECAY_STEP}")
+fi
+if [[ -n "${MAIN_LR_DECAY_FACTOR}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--main_lr_decay_factor "${MAIN_LR_DECAY_FACTOR}")
 fi
 ( cd "${DECA_DIR}" && \
   python optimize.py --path "${DATA_DIR}" \
