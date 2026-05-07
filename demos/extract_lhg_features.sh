@@ -53,6 +53,18 @@ Optional flags:
                         build via tools/build_mediapipe_flame_correspondence.py)
   --run-deca-encoder   also invoke DECA coarse encoder for diagnostics
                        (NOT used for any LHG output channel)
+  --detector {fan|mediapipe}
+                       landmark detector                  (default fan)
+                       fan       : face_alignment 68-pt, matches avatar-fit
+                                   precision but ~3x slower than mediapipe
+                       mediapipe : MediaPipe FaceMesh 478-pt, fast but
+                                   weak EPnP precision
+  --camera-convention {hravatar|opencv}
+                       coordinate frame for global_rot / translation /
+                       world_mat                          (default hravatar)
+                       hravatar  : X right, Y up, -Z forward — directly
+                                   consumable by HRAvatar's renderer
+                       opencv    : X right, Y down, +Z forward (raw EPnP)
   --quiet              suppress progress bar
   -h, --help           print this message and exit
 
@@ -87,6 +99,8 @@ WORLD_MAT_CAL_FRAMES=""
 FLAME_SCALE=""
 CORRESPONDENCE=""
 RUN_DECA_ENCODER=0
+DETECTOR=""
+CAMERA_CONVENTION=""
 QUIET=0
 
 require_value() {
@@ -111,6 +125,8 @@ while [[ $# -gt 0 ]]; do
     --flame-scale)  require_value "$@"; FLAME_SCALE="$2"; shift 2 ;;
     --correspondence) require_value "$@"; CORRESPONDENCE="$2"; shift 2 ;;
     --run-deca-encoder) RUN_DECA_ENCODER=1; shift ;;
+    --detector)     require_value "$@"; DETECTOR="$2"; shift 2 ;;
+    --camera-convention) require_value "$@"; CAMERA_CONVENTION="$2"; shift 2 ;;
     --quiet)        QUIET=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
@@ -141,6 +157,8 @@ EXTRA_ARGS=()
 [[ -n "${FLAME_SCALE}" ]]           && EXTRA_ARGS+=(--flame-scale "${FLAME_SCALE}")
 [[ -n "${CORRESPONDENCE}" ]]        && EXTRA_ARGS+=(--correspondence "${CORRESPONDENCE}")
 [[ "${RUN_DECA_ENCODER}" == "1" ]]  && EXTRA_ARGS+=(--run-deca-encoder)
+[[ -n "${DETECTOR}" ]]              && EXTRA_ARGS+=(--detector "${DETECTOR}")
+[[ -n "${CAMERA_CONVENTION}" ]]     && EXTRA_ARGS+=(--camera-convention "${CAMERA_CONVENTION}")
 [[ "${QUIET}" == "1" ]]             && EXTRA_ARGS+=(--quiet)
 
 python -m lhg.extract \

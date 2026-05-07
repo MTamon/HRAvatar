@@ -23,6 +23,18 @@ class LHGConfig:
     mode: Mode
     fps: float
 
+    # Landmark detector for both the stable bbox and the EPnP solve.
+    # 'fan' is the avatar-fit-compatible default — its 68 dlib-ordered
+    # landmarks include the well-distributed brow + nose + eye + face
+    # contour points needed for accurate per-frame pose recovery, and
+    # the static FLAME barycentric mapping (assets/flame_model/
+    # landmark_embedding.npy) is reusable verbatim.
+    # 'mediapipe' is faster but lacks anatomically correct lateral
+    # coverage in MICA's 105 correspondences, so per-frame depth has
+    # ~10x more noise than FAN-based EPnP — workable only with
+    # significant L3 (LHG model) temporal regularization.
+    detector_type: str = 'fan'
+
     # Camera intrinsics in the OUTER-CROP coordinate system (the same
     # space the EPnP solve runs in). Use one of the named presets via
     # ``intrinsics_preset`` or pass (fx, fy, cx, cy) directly.
@@ -41,19 +53,35 @@ class LHGConfig:
     # an extra pass that only ``pseudo-online`` performs.
     #
     # ``hampel_min_sigma_*`` floors the local MAD-derived sigma so the
-    # threshold never collapses to ~0 on very stable signals. Tuned to
-    # the natural per-frame noise floor of each channel; rejection then
-    # only fires for genuinely large jumps. Set to 0.0 for legacy
-    # MAD-only behaviour (will reject sub-noise variation as outliers).
+    # threshold never collapses to ~0 on very stable signals AND so that
+    # natural head/face motion (which can briefly produce per-frame
+    # deltas much larger than the local MAD estimate around a quiet
+    # baseline) does NOT get misclassified as an outlier.
+    #
+    # The per-channel defaults below are sized so that the rejection
+    # threshold (3 * min_sigma) covers natural motion comfortably:
+    #
+    # * expression (50d): SMIRK output range ~[-3, +3]; per-frame delta
+    #   on speech onset can hit 0.5/dim. Floor 0.30 → threshold 0.90.
+    # * jaw (3d): per-frame 0.05-0.10 rad during fast speech. Floor
+    #   0.10 → threshold 0.30 rad (~17°).
+    # * eyelid (2d): blink takes ~3 frames to close from 0→1, i.e.
+    #   ~0.33/frame. Floor 0.30 → threshold 0.90 covers full blink.
+    # * global_rot (3d, axis-angle): natural fast head turn ~6°/frame
+    #   = 0.10 rad. Floor 0.30 → threshold 0.90 rad (~52°), tolerates
+    #   a head whip without misattributing it to a tracking glitch.
+    # * translation (3d, FLAME canonical units): max real shift
+    #   ~3-5 cm/frame = 0.02-0.04 unit. Floor 0.05 → threshold 0.15
+    #   (huge per-frame jump = clear anomaly).
     causal_hampel_window: int = 5
     causal_hampel_k_sigma: float = 3.0
     bidirectional_hampel_window: int = 11
     bidirectional_hampel_k_sigma: float = 3.0
-    hampel_min_sigma_expression: float = 0.05    # SMIRK exp std floor
-    hampel_min_sigma_jaw: float = 0.005          # rad/axis-angle floor
-    hampel_min_sigma_eyelid: float = 0.02        # 0-1 normalised floor
-    hampel_min_sigma_global_rot: float = 0.005   # rad floor
-    hampel_min_sigma_translation: float = 0.005  # FLAME canonical units
+    hampel_min_sigma_expression: float = 0.30
+    hampel_min_sigma_jaw: float = 0.10
+    hampel_min_sigma_eyelid: float = 0.30
+    hampel_min_sigma_global_rot: float = 0.30
+    hampel_min_sigma_translation: float = 0.05
 
     # FLAME convention. v1 uses ``flame_scale=4.0`` (HRAvatar default);
     # v2 uses 1.0. The output ``translation`` channel is always stored
@@ -73,6 +101,14 @@ class LHGConfig:
     # per-frame ``cam`` / ``pose`` can be persisted alongside the SMIRK
     # output for offline debugging.
     run_deca_encoder: bool = False
+
+    # Camera coordinate convention for the global_rot / translation /
+    # world_mat outputs. Default 'hravatar' produces values directly
+    # consumable by HRAvatar's renderer (X right, Y up, -Z forward).
+    # 'opencv' keeps the raw EPnP output (X right, Y down, +Z forward)
+    # — only useful for pipelines that already have their own
+    # OpenCV→OpenGL conversion downstream.
+    camera_convention: str = 'hravatar'
 
 
 INTRINSICS_PRESETS = {

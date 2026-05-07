@@ -18,38 +18,37 @@ class LHGFeatures:
 
     Camera convention
     -----------------
-    ``global_rot`` and ``translation`` are in OpenCV camera coordinates
-    (camera looks down +Z, X right, Y down) — the natural output of
-    cv2.solvePnP. ``world_mat`` is the camera-extrinsic translation
-    in those same coordinates, with ``world_mat[2, 3] = +mean(tvec_z)
-    * flame_scale``. This is NOT directly compatible with HRAvatar's
-    renderer convention (camera looks down -Z; ``world_mat[2, 3]`` is
-    negative for an object in front of the camera).
+    By default ``camera_convention='hravatar'``: the (X right, Y up,
+    -Z forward) frame that HRAvatar's renderer (and DECA's
+    ``optimize.py`` ``projection`` function) consume directly.
+    ``world_mat[2, 3]`` is NEGATIVE for an object in front of the camera
+    (matches the avatar-fit ``tracked_params.json`` sign convention).
 
-    Downstream consumers feeding LHG features into HRAvatar's renderer
-    must apply the OpenCV→HRAvatar sign-flip on Y and Z (and the
-    corresponding rotation conversion). Storing the raw OpenCV output
-    keeps the EPnP semantics transparent and lets each consumer pick
-    the convention conversion appropriate for its renderer.
+    The pipeline can also emit raw OpenCV (X right, Y down, +Z forward)
+    by setting ``cfg.camera_convention='opencv'`` — useful for
+    downstream pipelines that maintain their own OpenCV→OpenGL
+    conversion. The conversion between the two is M = diag(1, -1, -1)
+    on both translation and rotation axis (see
+    ``lhg.epnp.convert_pose_opencv_to_hravatar``).
     """
 
     frame_basenames: np.ndarray         # (N,) <U..
     expression: np.ndarray              # (N, 50) float32
     jaw: np.ndarray                     # (N, 3) float32
     eyelid: np.ndarray                  # (N, 2) float32
-    global_rot: np.ndarray              # (N, 3) float32 axis-angle, OpenCV
-    translation: np.ndarray             # (N, 3) float32 FLAME canonical, OpenCV
+    global_rot: np.ndarray              # (N, 3) float32 axis-angle
+    translation: np.ndarray             # (N, 3) float32 FLAME canonical units
     valid_mask: np.ndarray              # (N,) bool — False = MediaPipe miss
     interpolated_mask: np.ndarray       # (N,) bool — True = filled in pseudo-online
     rejected_mask: np.ndarray           # (N,) bool — True = Hampel-rejected
     mode: str                           # 'online' / 'pseudo-online'
     intrinsics: np.ndarray              # (4,) [fx, fy, cx, cy]
-    world_mat: np.ndarray               # (4, 4) float32, OpenCV camera convention
+    world_mat: np.ndarray               # (4, 4) float32, in camera_convention frame
     outer_bbox: np.ndarray              # (4,) int32 [xmin, xmax, ymin, ymax] in raw video coord
     fps: float
     image_size: int
     flame_scale: float
-    camera_convention: str = 'opencv'   # 'opencv' or 'hravatar' (currently always 'opencv')
+    camera_convention: str = 'hravatar' # 'hravatar' (default) or 'opencv'
     metadata: dict = field(default_factory=dict)
 
     def write(self, path: str | Path) -> None:

@@ -50,12 +50,14 @@ from .video import FrameSource, load_outer_offset
 
 @dataclass
 class _BboxState:
-    """Causal hysteresis follower state (per stable_bbox.py:_hysteresis_forward)."""
+    """Causal hysteresis follower state (per stable_bbox.py:_hysteresis_forward)
+    plus optional FAN-detector bbox seed (constant across the clip)."""
     anchor: np.ndarray              # (2,) current emitted center
     target: np.ndarray              # (2,) candidate to chase
     ring: np.ndarray                # (window,) bool sliding history
     ring_idx: int = 0
     initialized: bool = False
+    fan_bbox: np.ndarray | None = None  # (4,) [x1, y1, x2, y2] for FAN, seeded once
 
 
 def _step_bbox_hysteresis(
@@ -96,18 +98,38 @@ def _step_bbox_hysteresis(
     return state.anchor.copy()
 
 
-def _bbox_size_from_landmarks(landmarks_478: np.ndarray) -> tuple[np.ndarray, float]:
-    """Stable-subset (center, size) extraction. Same formula as
-    ``preprocess.stable_bbox.extract_bbox_center_size``.
+def _bbox_size_from_landmarks(
+    landmarks: np.ndarray, detector_type: str,
+) -> tuple[np.ndarray, float]:
+    """(center, size) extraction from per-detector stable subset.
+
+    For MediaPipe (478-pt) we use STABLE_LANDMARK_INDICES (~15 pts on
+    eyes / nose / temples). For FAN (68-pt) we use the 31-pt static
+    subset (brow + nose + eye, indices 17-47), which has equivalent
+    expression-invariance and a similar X/Y span across the face. Both
+    formulas use the legacy ``(width + height) / 2`` size convention so
+    SMIRK's 224-crop scale is consistent across detectors.
     """
-    pts = landmarks_478[STABLE_LANDMARK_INDICES]
+    if detector_type == 'mediapipe':
+        pts = landmarks[STABLE_LANDMARK_INDICES]
+        size_cal = STABLE_LANDMARK_SIZE_CALIBRATION
+    elif detector_type == 'fan':
+        # dlib idx 17..47 inclusive — same set as DLIB_STATIC_PNP_RANGE.
+        pts = landmarks[17:48]
+        # FAN's brow-to-nose-tip span happens to match the unscaled
+        # legacy formula closely (it covers most of the face height
+        # naturally); keep calibration at 1.0 for now and let
+        # bbox_scale handle the SMIRK margin.
+        size_cal = 1.0
+    else:
+        raise ValueError(f'unknown detector_type {detector_type!r}')
     xs = pts[:, 0]
     ys = pts[:, 1]
     left = float(np.min(xs))
     right = float(np.max(xs))
     top = float(np.min(ys))
     bottom = float(np.max(ys))
-    size = ((right - left) + (bottom - top)) / 2.0 * STABLE_LANDMARK_SIZE_CALIBRATION
+    size = ((right - left) + (bottom - top)) / 2.0 * size_cal
     center = np.array(
         [(left + right) / 2.0, (top + bottom) / 2.0], dtype=np.float64,
     )
@@ -164,7 +186,7 @@ class FrameTrace:
 
 def per_frame_core(
     image_outer_rgb: np.ndarray,
-    detector: MediaPipeFaceLandmarker,
+    detector,
     smirk: SMIRKEncoder,
     correspondence: MediaPipeFLAMECorrespondence,
     K: np.ndarray,
@@ -174,11 +196,47 @@ def per_frame_core(
 ) -> FrameTrace:
     """One causal frame step. Shared by online and pseudo-online modes.
 
+    ``detector`` is duck-typed: any object with a ``.detect(rgb)``
+    returning either ``None`` or an ``(N, 2)`` landmark array works
+    (currently MediaPipe 478-pt or FAN 68-pt).
+
     The only inter-frame state used here is ``bbox_state`` (causal
     hysteresis follower) and ``last_valid`` (used to hold values across
     a detector dropout). Hampel rejection happens one level up.
     """
-    landmarks = detector.detect(image_outer_rgb)
+    # For FAN: skip per-frame S3FD detection by passing a TIGHT, fixed
+    # bbox sized to the actual face. S3FD's bbox would otherwise wobble
+    # ~5 px frame-to-frame even on a still face, and any bbox shift
+    # propagates into 2-3 px landmark jitter; conversely a bbox that
+    # is too LOOSE (e.g. the full 512x512 image) makes the face occupy
+    # ~75 px in the 256-input 2DFAN, well below the model's optimal
+    # ~195 px scale, sharply degrading landmark accuracy.
+    #
+    # We seed the fixed bbox from the first valid frame (FAN-auto-
+    # detect once) and reuse it across the clip. ``bbox_state.fan_bbox``
+    # holds the persistent value; on the first call it's None and the
+    # auto-detect pass populates it.
+    if cfg.detector_type == 'fan':
+        if getattr(bbox_state, 'fan_bbox', None) is not None:
+            landmarks = detector.detect(
+                image_outer_rgb, bbox_xyxy=bbox_state.fan_bbox,
+            )
+        else:
+            landmarks = detector.detect(image_outer_rgb)
+            if landmarks is not None:
+                # Compute a tight bbox from this frame's landmarks +
+                # 25% margin and freeze it for subsequent frames.
+                xs, ys = landmarks[:, 0], landmarks[:, 1]
+                x1, x2 = float(xs.min()), float(xs.max())
+                y1, y2 = float(ys.min()), float(ys.max())
+                w_pad = (x2 - x1) * 0.25
+                h_pad = (y2 - y1) * 0.25
+                bbox_state.fan_bbox = np.array(
+                    [x1 - w_pad, y1 - h_pad, x2 + w_pad, y2 + h_pad],
+                    dtype=np.float64,
+                )
+    else:
+        landmarks = detector.detect(image_outer_rgb)
     if landmarks is None:
         # Detector miss: hold previous valid sample if available.
         if last_valid is None:
@@ -194,7 +252,7 @@ def per_frame_core(
             valid=False,
         )
 
-    raw_center, raw_size = _bbox_size_from_landmarks(landmarks)
+    raw_center, raw_size = _bbox_size_from_landmarks(landmarks, cfg.detector_type)
     smoothed_center = _step_bbox_hysteresis(bbox_state, raw_center, cfg)
 
     face_224 = _warp_to_224(
@@ -213,6 +271,7 @@ def per_frame_core(
         correspondence.flame_canonical_xyz,
         K,
         cfg.flame_scale,
+        camera_convention=cfg.camera_convention,
     )
     if not ok:
         if last_valid is None:
@@ -314,36 +373,54 @@ def _compute_outer_bbox_from_landmarks(
     return np.array([xb_min, xb_max, yb_min, yb_max], dtype=np.int32)
 
 
+def _axis_angle_to_R(aa: np.ndarray) -> np.ndarray:
+    """Convert axis-angle (3,) to 3x3 rotation matrix (numpy Rodrigues)."""
+    import cv2
+    R, _ = cv2.Rodrigues(np.asarray(aa, dtype=np.float64).reshape(3, 1))
+    return R
+
+
+def _R_to_axis_angle(R: np.ndarray) -> np.ndarray:
+    import cv2
+    aa, _ = cv2.Rodrigues(np.asarray(R, dtype=np.float64))
+    return aa.reshape(3)
+
+
 def _resolve_world_mat_and_recenter(
-    cfg: LHGConfig, translations: np.ndarray, valid: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute the clip-constant world_mat AND recenter the per-frame
-    translation deltas around it.
+    cfg: LHGConfig,
+    global_rots: np.ndarray,
+    translations: np.ndarray,
+    valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute the clip-constant world_mat (rotation + translation) AND
+    recenter per-frame global_rot / translation around it.
 
     HRAvatar's renderer convention (matches what DECA ``optimize.py``
     writes when ``with_translation_camera=False``):
 
     * ``world_mat`` carries the absolute camera-to-mean-head transform
-      (``world_mat[2, 3]`` is the dominant depth term).
+      (rotation in [:3, :3] absorbs the FLAME-canonical-to-camera-
+      facing pre-rotation; translation in [:3, 3] absorbs the depth).
+    * Per-frame ``global_rot`` is a SMALL axis-angle delta around the
+      reference rotation, applied AFTER the world_mat rotation.
     * Per-frame ``translation`` is a SMALL delta in FLAME canonical
-      units around that mean, applied additively to FLAME vertices
-      before the world_mat * flame_scale projection.
+      units around the reference translation, applied additively to
+      FLAME vertices before the world_mat * flame_scale projection.
 
-    EPnP returns the TOTAL camera-to-object tvec on each frame, which
-    aggregates both terms. This routine splits them: the calibration
-    window's mean tvec becomes ``world_mat[:3, 3]`` (in camera-extrinsic
-    units, i.e. multiplied by ``flame_scale``), and per-frame deltas
-    are recovered by subtracting the calibration mean.
+    EPnP returns the TOTAL camera-to-object pose on each frame. This
+    routine splits it: the calibration-window reference pose becomes
+    world_mat, and per-frame deltas are recovered via R_delta =
+    R_ref^T @ R_total and t_delta = t_total - t_ref.
 
     When ``cfg.world_mat_path`` is set we instead load the world_mat
-    from an existing tracked_params.json and recenter against the
-    translation it implies, keeping the LHG output drop-in compatible
-    with the avatar-fit pipeline.
+    from an existing tracked_params.json and recenter against it,
+    keeping LHG output drop-in compatible with the avatar-fit pipeline.
 
     Returns
     -------
-    world_mat : (4, 4) float32
-    translation_recentered : (N, 3) float32 in FLAME canonical units
+    world_mat              : (4, 4) float32
+    global_rot_recentered  : (N, 3) float32 axis-angle deltas
+    translation_recentered : (N, 3) float32 deltas in FLAME canonical units
     """
     if cfg.world_mat_path is not None:
         import json
@@ -358,7 +435,6 @@ def _resolve_world_mat_and_recenter(
         elif 'frames' in payload and payload['frames']:
             wm = np.asarray(payload['frames'][0]['world_mat'], dtype=np.float64)
         else:
-            # tracked_params.json schema: per-frame dicts under filename keys.
             frame_keys = [k for k in payload if k.endswith('.png') or k.endswith('.jpg')]
             if frame_keys:
                 wm = np.asarray(payload[frame_keys[0]]['world_mat'], dtype=np.float64)
@@ -368,31 +444,63 @@ def _resolve_world_mat_and_recenter(
                     f'top level, frames[0].world_mat, or per-image-key dicts')
         if wm.shape == (3, 4):
             wm = np.vstack([wm, [0.0, 0.0, 0.0, 1.0]])
-        # Implied calibration mean (in canonical units): wm[:3,3] / flame_scale.
-        implied_mean = wm[:3, 3] / float(cfg.flame_scale)
-        recentered = translations - implied_mean.astype(translations.dtype)
-        return wm.astype(np.float32), recentered
+        R_ref = wm[:3, :3]
+        t_ref_canonical = wm[:3, 3] / float(cfg.flame_scale)
+        # Recenter rotations: R_delta = R_ref^T @ R_total
+        R_ref_T = R_ref.T
+        rot_recentered = np.zeros_like(global_rots, dtype=np.float32)
+        for i in range(global_rots.shape[0]):
+            R_total = _axis_angle_to_R(global_rots[i])
+            R_delta = R_ref_T @ R_total
+            rot_recentered[i] = _R_to_axis_angle(R_delta).astype(np.float32)
+        trans_recentered = translations - t_ref_canonical.astype(translations.dtype)
+        return wm.astype(np.float32), rot_recentered, trans_recentered
 
     # Calibrate from the first valid frames in the clip.
     n_calib = max(1, int(cfg.world_mat_calibration_frames))
-    cum = 0
-    accum = np.zeros(3, dtype=np.float64)
+    valid_frames = []
     for i in range(translations.shape[0]):
         if valid[i]:
-            accum += translations[i].astype(np.float64)
-            cum += 1
-            if cum >= n_calib:
+            valid_frames.append(i)
+            if len(valid_frames) >= n_calib:
                 break
-    if cum == 0:
-        return np.eye(4, dtype=np.float32), translations.copy()
-    mean_t = accum / cum
+    if not valid_frames:
+        return (
+            np.eye(4, dtype=np.float32),
+            global_rots.astype(np.float32, copy=True),
+            translations.astype(np.float32, copy=True),
+        )
+
+    # Translation reference: arithmetic mean over calibration window.
+    t_ref = translations[valid_frames].astype(np.float64).mean(axis=0)
+
+    # Rotation reference: chordal mean of rotation matrices, then SVD-
+    # project back to SO(3). For ~30-60 frames of a roughly-still head,
+    # this is well within the convergence radius of the chordal mean.
+    R_sum = np.zeros((3, 3), dtype=np.float64)
+    for i in valid_frames:
+        R_sum += _axis_angle_to_R(global_rots[i])
+    R_sum /= len(valid_frames)
+    U, _, Vt = np.linalg.svd(R_sum)
+    R_ref = U @ Vt
+    if np.linalg.det(R_ref) < 0:
+        # Reflect to keep right-handed.
+        U[:, -1] *= -1
+        R_ref = U @ Vt
+
     wm = np.eye(4, dtype=np.float64)
-    # world_mat translation is in camera-extrinsic units (i.e. canonical
-    # translation * flame_scale, so the renderer's flame_scale * t_canonical
-    # + wm gives the same total depth EPnP recovered).
-    wm[:3, 3] = mean_t * float(cfg.flame_scale)
-    recentered = translations - mean_t.astype(translations.dtype)
-    return wm.astype(np.float32), recentered
+    wm[:3, :3] = R_ref
+    wm[:3, 3] = t_ref * float(cfg.flame_scale)
+
+    # Recenter per-frame against the reference.
+    R_ref_T = R_ref.T
+    rot_recentered = np.zeros_like(global_rots, dtype=np.float32)
+    for i in range(global_rots.shape[0]):
+        R_total = _axis_angle_to_R(global_rots[i])
+        R_delta = R_ref_T @ R_total
+        rot_recentered[i] = _R_to_axis_angle(R_delta).astype(np.float32)
+    trans_recentered = (translations - t_ref.astype(translations.dtype)).astype(np.float32)
+    return wm.astype(np.float32), rot_recentered, trans_recentered
 
 
 def extract(
@@ -420,15 +528,20 @@ def extract(
         historical crop). The outer_bbox value is still passed through
         to the output as metadata.
     """
-    from .correspondence import load as load_correspondence
+    from .correspondence import default_asset_for, load as load_correspondence
 
-    detector = MediaPipeFaceLandmarker()
+    if cfg.detector_type == 'fan':
+        from .detector_fan import FANLandmarker
+        detector = FANLandmarker()
+    elif cfg.detector_type == 'mediapipe':
+        detector = MediaPipeFaceLandmarker()
+    else:
+        raise ValueError(f'unknown detector_type {cfg.detector_type!r}')
+
     smirk = SMIRKEncoder()
-    correspondence = (
-        load_correspondence(correspondence_path)
-        if correspondence_path is not None
-        else load_correspondence()
-    )
+    if correspondence_path is None:
+        correspondence_path = default_asset_for(cfg.detector_type)
+    correspondence = load_correspondence(correspondence_path)
     K = intrinsics_matrix(*cfg.intrinsics)
 
     raw_frames_rgb: list[np.ndarray] = list(frames.iter_frames())
@@ -612,8 +725,8 @@ def extract(
             [quat_to_axis_angle(quats[i]) for i in range(n_total)], axis=0,
         ).astype(np.float32)
 
-    world_mat, translation = _resolve_world_mat_and_recenter(
-        cfg, translation, valid | interpolated,
+    world_mat, global_rot, translation = _resolve_world_mat_and_recenter(
+        cfg, global_rot, translation, valid | interpolated,
     )
 
     detector.close()
@@ -635,4 +748,5 @@ def extract(
         fps=cfg.fps,
         image_size=cfg.image_size,
         flame_scale=cfg.flame_scale,
+        camera_convention=cfg.camera_convention,
     )

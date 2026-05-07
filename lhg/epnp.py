@@ -5,10 +5,55 @@ optimization is too slow for a 30 fps inference budget. EPnP is a
 1-shot analytical solver (~1-2 ms/frame) that produces equivalent
 per-frame quality once paired with a clean stable subset of
 correspondences and a precomputed FLAME 3D landmark table.
+
+Camera convention
+-----------------
+``solve_epnp`` accepts a ``camera_convention`` flag that controls the
+output coordinate frame:
+
+* ``'opencv'`` (raw EPnP) — X right, Y down, +Z forward.
+* ``'hravatar'`` (default) — X right, Y up, -Z forward. This is the
+  convention HRAvatar's renderer (and DECA's ``optimize.py``
+  ``projection``) consume directly: ``world_mat[:3, 3]`` has a
+  NEGATIVE Z component for an object in front of the camera, and the
+  projection formula ``i = fx * x/z + cx`` produces a horizontally
+  consistent mapping with the input image when z<0.
+
+The conversion is M = diag(1, -1, -1) applied to both translation and
+rotation:
+* tvec_hr = (tvec_x, -tvec_y, -tvec_z)
+* For axis-angle: axis_hr = (axis_x, -axis_y, -axis_z), angle unchanged
+  (equivalent to R_hr = M @ R_cv @ M).
 """
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
+
+
+CameraConvention = Literal['opencv', 'hravatar']
+
+# Diagonal sign-flip matrix for OpenCV → HRAvatar conversion.
+# Applied to both translation vector and the 3D rotation axis.
+_CV_TO_HR_DIAG = np.array([1.0, -1.0, -1.0], dtype=np.float64)
+
+
+def convert_pose_opencv_to_hravatar(
+    rvec_cv: np.ndarray, tvec_cv: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert an OpenCV (rvec, tvec) pair to HRAvatar/OpenGL convention.
+
+    Both inputs are 1-D arrays of length 3. The translation is
+    elementwise multiplied by diag(1, -1, -1). The axis-angle rotation
+    is rotated similarly: M @ R_cv @ M can be expressed in axis-angle
+    form by flipping the same components of the axis (because conjugation
+    by a diagonal sign matrix flips the off-diagonal block of R, which
+    in axis-angle space is exactly the corresponding axis components).
+    """
+    rvec_cv = np.asarray(rvec_cv, dtype=np.float64).reshape(3)
+    tvec_cv = np.asarray(tvec_cv, dtype=np.float64).reshape(3)
+    return rvec_cv * _CV_TO_HR_DIAG, tvec_cv * _CV_TO_HR_DIAG
 
 
 def solve_epnp(
@@ -16,6 +61,7 @@ def solve_epnp(
     object_points_3d: np.ndarray,
     K: np.ndarray,
     flame_scale: float,
+    camera_convention: CameraConvention = 'hravatar',
 ) -> tuple[np.ndarray, np.ndarray, bool] | tuple[None, None, bool]:
     """Solve PnP for a single frame.
 
@@ -63,8 +109,17 @@ def solve_epnp(
     if not ok:
         return None, None, False
 
+    rvec_out = rvec.flatten().astype(np.float64)
     tvec_canonical = tvec.flatten() / float(flame_scale)
-    return rvec.flatten().astype(np.float64), tvec_canonical.astype(np.float64), True
+    if camera_convention == 'hravatar':
+        rvec_out, tvec_canonical = convert_pose_opencv_to_hravatar(
+            rvec_out, tvec_canonical,
+        )
+    elif camera_convention != 'opencv':
+        raise ValueError(
+            f'unknown camera_convention {camera_convention!r}; '
+            f'expected "opencv" or "hravatar"')
+    return rvec_out, tvec_canonical.astype(np.float64), True
 
 
 def axis_angle_to_quat(axis_angle: np.ndarray) -> np.ndarray:

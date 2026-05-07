@@ -63,6 +63,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument('--run-deca-encoder', action='store_true',
                    help='Diagnostic only: also invoke DECA coarse encoder.')
+    p.add_argument(
+        '--detector', choices=('fan', 'mediapipe'), default='fan',
+        help='Landmark detector. fan (default) = face_alignment 68-pt, '
+             'matches the avatar-fit pipeline and gives ~5-10x lower '
+             'per-frame EPnP noise than mediapipe. mediapipe = MediaPipe '
+             'FaceMesh 478-pt, faster but with weaker EPnP precision.',
+    )
+    p.add_argument(
+        '--camera-convention', choices=('hravatar', 'opencv'), default='hravatar',
+        help='Coordinate frame for global_rot / translation / world_mat. '
+             'hravatar (default) is directly consumable by HRAvatar\'s '
+             'renderer. opencv keeps the raw EPnP output for downstream '
+             'pipelines that have their own conversion.',
+    )
     p.add_argument('--quiet', action='store_true', help='Suppress progress bar.')
     return p
 
@@ -89,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         world_mat_path=args.world_mat,
         world_mat_calibration_frames=args.world_mat_calibration_frames,
         run_deca_encoder=args.run_deca_encoder,
+        camera_convention=args.camera_convention,
+        detector_type=args.detector,
     )
 
     frames = FrameSource(args.video)

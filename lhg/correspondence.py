@@ -41,6 +41,16 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_ASSET = Path('./assets/lhg/mediapipe_flame_landmarks.npz')
+DEFAULT_FAN_ASSET = Path('./assets/lhg/dlib_flame_landmarks.npz')
+
+
+def default_asset_for(detector_type: str) -> Path:
+    if detector_type == 'fan':
+        return DEFAULT_FAN_ASSET
+    if detector_type == 'mediapipe':
+        return DEFAULT_ASSET
+    raise ValueError(
+        f'unknown detector_type {detector_type!r}; expected "fan" or "mediapipe"')
 
 
 @dataclass
