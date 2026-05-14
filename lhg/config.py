@@ -137,6 +137,20 @@ class LHGConfig:
     # output for offline debugging.
     run_deca_encoder: bool = False
 
+    # Path to the avatar checkpoint directory containing
+    # ``flame_params_net.pth`` (typically
+    # ``outputs/custom/<avatar>/saved_model/epoch_<E>``). When set, the
+    # online SMIRKEncoder loads these per-subject trained weights so
+    # the online output matches the avatar's renderer-time SMIRK
+    # output (the same weights ``lhg.teacher`` uses to produce the
+    # offline teacher target). When ``None`` (default), SMIRKEncoder
+    # falls back to the pretrained initialization. Under the
+    # 2026-05-15 grand design clarification, both paths should
+    # ordinarily share the same SMIRK weights so the only differences
+    # between online and teacher come from online-only constraints
+    # (causality, no clip-wide joint optimization).
+    avatar_checkpoint: str | None = None
+
     # Online backend selects which per-frame translation/global_rot
     # estimator the pipeline runs:
     #

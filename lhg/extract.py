@@ -92,6 +92,19 @@ def build_parser() -> argparse.ArgumentParser:
              'expression / jaw / eyelid come from SMIRK in both cases.',
     )
     p.add_argument(
+        '--avatar-checkpoint', default=None,
+        help='Path to the avatar checkpoint directory containing '
+             '``flame_params_net.pth`` (typically '
+             '``outputs/custom/<avatar>/saved_model/epoch_<E>``). When set, '
+             'the online SMIRK uses the avatar\'s per-subject trained weights '
+             '— required for the online output to match the offline teacher '
+             'in expression / jaw / eyelid. Under the 2026-05-15 grand design '
+             'clarification, both paths should normally share the same SMIRK '
+             'weights so the only differences between online and teacher come '
+             'from online-only constraints (causality, no clip-wide joint '
+             'optimization).',
+    )
+    p.add_argument(
         '--detector', choices=('mediapipe', 'fan'), default='mediapipe',
         help='Landmark detector. mediapipe (default) = MediaPipe '
              'FaceLandmarker 478-pt + iris; fan = face_alignment 68-pt '
@@ -184,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         lpf_jaw_cutoff_hz=args.lpf_jaw_cutoff_hz,
         lpf_offline_lookahead=args.lookahead_offline,
         online_backend=args.backend,
+        avatar_checkpoint=args.avatar_checkpoint,
     )
 
     frames = FrameSource(args.video)

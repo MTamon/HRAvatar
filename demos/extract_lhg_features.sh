@@ -99,6 +99,18 @@ Optional flags:
                        offline DECA coarse encoder (2026-05-14 grand
                        design); global_rot = DECA pose[0:3], translation
                        = 0 (Phase B Stage 1).
+  --avatar-checkpoint DIR
+                       avatar checkpoint dir containing
+                       flame_params_net.pth (e.g.
+                       outputs/custom/<avatar>/saved_model/epoch_<E>).
+                       Without this flag the online SMIRK falls back to
+                       its pretrained init and the expression / jaw /
+                       eyelid outputs WILL differ from the avatar's
+                       offline-teacher output. With it set, both paths
+                       share the same per-subject SMIRK weights so the
+                       only remaining differences come from online-only
+                       constraints (causality, no clip-wide joint
+                       optimization).
   --quiet              suppress progress bar
   -h, --help           print this message and exit
 
@@ -142,6 +154,7 @@ LPF_JAW_CUTOFF_HZ=""
 LOOKAHEAD_OFFLINE=""
 CAMERA_CONVENTION=""
 BACKEND=""
+AVATAR_CHECKPOINT=""
 QUIET=0
 
 require_value() {
@@ -174,6 +187,7 @@ while [[ $# -gt 0 ]]; do
     --lookahead-offline) require_value "$@"; LOOKAHEAD_OFFLINE="$2"; shift 2 ;;
     --camera-convention) require_value "$@"; CAMERA_CONVENTION="$2"; shift 2 ;;
     --backend)      require_value "$@"; BACKEND="$2"; shift 2 ;;
+    --avatar-checkpoint|--avatar_checkpoint) require_value "$@"; AVATAR_CHECKPOINT="$2"; shift 2 ;;
     --quiet)        QUIET=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
@@ -212,6 +226,7 @@ EXTRA_ARGS=()
 [[ -n "${LOOKAHEAD_OFFLINE}" ]]     && EXTRA_ARGS+=(--lookahead-offline "${LOOKAHEAD_OFFLINE}")
 [[ -n "${CAMERA_CONVENTION}" ]]     && EXTRA_ARGS+=(--camera-convention "${CAMERA_CONVENTION}")
 [[ -n "${BACKEND}" ]]               && EXTRA_ARGS+=(--backend "${BACKEND}")
+[[ -n "${AVATAR_CHECKPOINT}" ]]     && EXTRA_ARGS+=(--avatar-checkpoint "${AVATAR_CHECKPOINT}")
 [[ "${QUIET}" == "1" ]]             && EXTRA_ARGS+=(--quiet)
 
 python -m lhg.extract \

@@ -549,7 +549,8 @@ def extract(
     else:
         raise ValueError(f'unknown detector_type {cfg.detector_type!r}')
 
-    smirk = SMIRKEncoder()
+    avatar_checkpoint = getattr(cfg, 'avatar_checkpoint', None)
+    smirk = SMIRKEncoder(avatar_checkpoint=avatar_checkpoint)
     if correspondence_path is None:
         correspondence_path = default_asset_for(cfg.detector_type)
     correspondence = load_correspondence(correspondence_path)
