@@ -328,15 +328,32 @@ def per_frame_core(
         # extract() resolved; but per_frame_core does not currently
         # see it. We emit the "absolute pose centered at world_mat"
         # convention that ``_recenter_against_world_mat`` already
-        # expects: just put the t_ref_canonical here so the
-        # subsequent recenter produces zero delta. The wm_t reference
-        # is read from bbox_state (which extract() stashed for us)
-        # to avoid expanding per_frame_core's signature.
+        # expects. The wm_t reference is read from bbox_state (which
+        # extract() stashed for us) to avoid expanding
+        # per_frame_core's signature.
         wm_t_canonical = getattr(bbox_state, 'wm_t_canonical', None)
         if wm_t_canonical is None:
             tvec_canonical = np.zeros(3, dtype=np.float64)
         else:
-            tvec_canonical = np.asarray(wm_t_canonical, dtype=np.float64)
+            tvec_canonical = np.asarray(wm_t_canonical, dtype=np.float64).copy()
+            # Phase B Stage 2: cam→z proxy. DECA's orthographic cam[0]
+            # (``scale``) is approximately inversely proportional to
+            # the object's depth from the camera. If the avatar-fit
+            # clip-mean cam scale is available (lhg_baseline.deca_cam_scale_ref),
+            # we lift z off the world_mat reference using:
+            #
+            #   z_frame = z_ref * (s_ref / s_frame)
+            #
+            # so larger s_frame (face closer than the clip mean) gives
+            # z_frame nearer the camera (less negative in the HRAvatar
+            # ``-Z forward`` convention; |z| smaller). The result is
+            # passed through ``_recenter_against_world_mat`` which
+            # subtracts wm_t_canonical to produce the delta the
+            # renderer / LHG model expects.
+            s_ref = getattr(bbox_state, 'deca_cam_scale_ref', None)
+            s_frame = float(deca_out['cam'][0]) if deca_out.get('cam') is not None else None
+            if s_ref is not None and s_frame is not None and s_frame > 1e-6:
+                tvec_canonical[2] = wm_t_canonical[2] * (s_ref / s_frame)
         ok = True
     else:
         img_pts_2d = landmarks[correspondence.mp_indices]
@@ -596,6 +613,12 @@ def extract(
     bbox_state.wm_t_canonical = (
         world_mat[:3, 3].astype(np.float64) / float(cfg.flame_scale)
     )
+    # Phase B Stage 2: clip-mean DECA cam reference. When available,
+    # the deca_encoder backend uses ``(s_ref / s_frame)`` to scale the
+    # reference depth and produce a real per-frame translation z.
+    # ``None`` means we stay at Stage 1 (translation = 0 delta).
+    bbox_state.deca_cam_scale_ref = getattr(
+        calibration, 'deca_cam_scale_ref', None)
     min_sigma_per_channel = {
         'expression': cfg.hampel_min_sigma_expression,
         'jaw': cfg.hampel_min_sigma_jaw,
