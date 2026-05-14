@@ -30,19 +30,52 @@ if TYPE_CHECKING:
 class SMIRKEncoder:
     """Wrapper around ``net_modules.flame_params_net_smirk.FlameParamsNetSmirk``.
 
-    Outputs match HRAvatar's training-time SMIRK call (same checkpoint,
-    same preprocessing, same output keys), so the LHG features can be
-    consumed by ``scene/gaussian_head_model.GaussianHeadModel.forward``
-    drop-in for visual sanity checks.
+    Two operating modes:
+
+    * Pretrained init (``avatar_checkpoint=None``, default): the model
+      is created with its native initial weights (SMIRK pretrained
+      backbone + freshly-initialised expression head). Used by the
+      LHG online extraction path, where we want a generic SMIRK that
+      can run on any frame.
+
+    * Avatar-trained weights (``avatar_checkpoint=<dir>``): the model
+      loads ``<dir>/flame_params_net.pth`` exactly the way
+      ``scene/gaussian_head_model.py:469-472`` does at render time.
+      This is the SMIRK the avatar's renderer actually consumes
+      (HRAvatar trains a per-subject SMIRK alongside the Gaussian
+      avatar), so it is the right encoder to use for LHG *teacher*
+      generation — the per-frame expression/jaw/eyelid it produces
+      are bit-equivalent to what the avatar's renderer reads off
+      ``flame_params_net(warped_image)`` during avatar training.
     """
 
-    def __init__(self, exp_dim: int = 50, device: str = 'cuda'):
+    def __init__(
+        self,
+        exp_dim: int = 50,
+        device: str = 'cuda',
+        avatar_checkpoint: str | Path | None = None,
+    ):
         import torch
         from net_modules.flame_params_net_smirk import FlameParamsNetSmirk
 
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.exp_dim = exp_dim
         self.model = FlameParamsNetSmirk(exp_dim=exp_dim).to(self.device)
+        if avatar_checkpoint is not None:
+            ckpt_dir = Path(avatar_checkpoint)
+            pth = ckpt_dir / 'flame_params_net.pth'
+            if not pth.is_file():
+                raise FileNotFoundError(
+                    f'flame_params_net.pth not found under {ckpt_dir}. '
+                    f'Expected the avatar checkpoint directory written by '
+                    f'``scene/gaussian_head_model.py:save_model`` (e.g. '
+                    f'``outputs/custom/<avatar>/saved_model/epoch_<E>``).')
+            state_dict = torch.load(
+                str(pth), map_location=self.device, weights_only=False)
+            self.model.load_state_dict(state_dict)
+            self.avatar_checkpoint = str(ckpt_dir)
+        else:
+            self.avatar_checkpoint = None
         self.model.eval()
 
     @staticmethod
@@ -61,6 +94,25 @@ class SMIRKEncoder:
         tens = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
         return tens
 
+    @staticmethod
+    def to_input_batch(faces_224_rgb: np.ndarray) -> 'torch.Tensor':
+        """Batched version of :meth:`to_input`.
+
+        Input shape ``(B, 224, 224, 3) uint8`` → output ``(B, 3, 224, 224)``
+        float32 in [0, 1]. Used by teacher generation where we encode
+        many frames in a single forward pass.
+        """
+        import torch
+
+        if faces_224_rgb.dtype != np.uint8:
+            raise TypeError('faces_224_rgb must be uint8')
+        if faces_224_rgb.ndim != 4 or faces_224_rgb.shape[1:] != (224, 224, 3):
+            raise ValueError(
+                f'faces_224_rgb must be (B, 224, 224, 3), got {faces_224_rgb.shape}')
+        arr = faces_224_rgb.astype(np.float32) / 255.0
+        tens = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
+        return tens
+
     def encode(self, face_224_rgb: np.ndarray) -> dict:
         """Returns a dict with numpy arrays for ``expression`` (50d),
         ``jaw`` (3d), ``eyelid`` (2d).
@@ -74,6 +126,21 @@ class SMIRKEncoder:
             'expression': out['expression_params'].squeeze(0).cpu().numpy().astype(np.float32),
             'jaw': out['jaw_params'].squeeze(0).cpu().numpy().astype(np.float32),
             'eyelid': out['eyelid_params'].squeeze(0).cpu().numpy().astype(np.float32),
+        }
+
+    def encode_batch(self, faces_224_rgb: np.ndarray) -> dict:
+        """Batched encode for teacher generation. Returns a dict with
+        per-batch numpy arrays for ``expression`` (B, 50), ``jaw`` (B, 3),
+        ``eyelid`` (B, 2)."""
+        import torch
+
+        tens = self.to_input_batch(faces_224_rgb).to(self.device)
+        with torch.no_grad():
+            out = self.model(tens)
+        return {
+            'expression': out['expression_params'].cpu().numpy().astype(np.float32),
+            'jaw': out['jaw_params'].cpu().numpy().astype(np.float32),
+            'eyelid': out['eyelid_params'].cpu().numpy().astype(np.float32),
         }
 
 

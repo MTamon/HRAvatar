@@ -41,6 +41,25 @@ Optional flags:
                          outer_offset.json sidecar is present.
   --expression-dim N     Expression dims to keep from offline expcode
                          (default 50, matches SMIRK / LHGFeatures).
+  --avatar-checkpoint D  Avatar checkpoint dir containing
+                         flame_params_net.pth (e.g.
+                         outputs/custom/<avatar>/saved_model/epoch_<E>).
+                         When set, expression / jaw / eyelid are
+                         recomputed by the avatar's trained SMIRK on
+                         the 224 warped crop from stable_bbox.npz —
+                         this matches what the renderer consumes at
+                         avatar training time. Without this flag the
+                         legacy behaviour (DECA optimize expcode) is
+                         used for backwards compatibility.
+  --subject-dir D        Directory with stable_bbox.npz + image/ etc.
+                         (defaults to --tracked-params parent).
+                         Only consulted with --avatar-checkpoint.
+  --prefer-outer-bbox    Force the outer_512 (stable_bbox.npz + image/)
+                         path even when stable_bbox_raw.npz + image_raw/
+                         exist. Default: raw-resolution path is
+                         preferred (matches data_loader.py).
+  --smirk-batch-size N   Forward batch size for SMIRK (default 16).
+  --device DEVICE        Compute device (default cuda).
   -h, --help             Print this message and exit.
 
 Output:
@@ -55,6 +74,11 @@ OUTPUT=""
 FPS=""
 IMAGE_SIZE=""
 EXPRESSION_DIM=""
+AVATAR_CHECKPOINT=""
+SUBJECT_DIR=""
+PREFER_OUTER_BBOX=0
+SMIRK_BATCH_SIZE=""
+DEVICE=""
 
 require_value() {
   if [[ $# -lt 2 || "$2" == --* ]]; then
@@ -71,6 +95,11 @@ while [[ $# -gt 0 ]]; do
     --fps)             require_value "$@"; FPS="$2"; shift 2 ;;
     --image-size|--image_size) require_value "$@"; IMAGE_SIZE="$2"; shift 2 ;;
     --expression-dim|--expression_dim) require_value "$@"; EXPRESSION_DIM="$2"; shift 2 ;;
+    --avatar-checkpoint|--avatar_checkpoint) require_value "$@"; AVATAR_CHECKPOINT="$2"; shift 2 ;;
+    --subject-dir|--subject_dir) require_value "$@"; SUBJECT_DIR="$2"; shift 2 ;;
+    --prefer-outer-bbox|--prefer_outer_bbox) PREFER_OUTER_BBOX=1; shift ;;
+    --smirk-batch-size|--smirk_batch_size) require_value "$@"; SMIRK_BATCH_SIZE="$2"; shift 2 ;;
+    --device)          require_value "$@"; DEVICE="$2"; shift 2 ;;
     -h|--help)         usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
     *)   echo "unexpected positional argument: $1" >&2; usage; exit 2 ;;
@@ -87,9 +116,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 EXTRA_ARGS=()
-[[ -n "${FPS}" ]]            && EXTRA_ARGS+=(--fps "${FPS}")
-[[ -n "${IMAGE_SIZE}" ]]     && EXTRA_ARGS+=(--image-size "${IMAGE_SIZE}")
-[[ -n "${EXPRESSION_DIM}" ]] && EXTRA_ARGS+=(--expression-dim "${EXPRESSION_DIM}")
+[[ -n "${FPS}" ]]                && EXTRA_ARGS+=(--fps "${FPS}")
+[[ -n "${IMAGE_SIZE}" ]]         && EXTRA_ARGS+=(--image-size "${IMAGE_SIZE}")
+[[ -n "${EXPRESSION_DIM}" ]]     && EXTRA_ARGS+=(--expression-dim "${EXPRESSION_DIM}")
+[[ -n "${AVATAR_CHECKPOINT}" ]]  && EXTRA_ARGS+=(--avatar-checkpoint "${AVATAR_CHECKPOINT}")
+[[ -n "${SUBJECT_DIR}" ]]        && EXTRA_ARGS+=(--subject-dir "${SUBJECT_DIR}")
+[[ "${PREFER_OUTER_BBOX}" == "1" ]] && EXTRA_ARGS+=(--prefer-outer-bbox)
+[[ -n "${SMIRK_BATCH_SIZE}" ]]   && EXTRA_ARGS+=(--smirk-batch-size "${SMIRK_BATCH_SIZE}")
+[[ -n "${DEVICE}" ]]             && EXTRA_ARGS+=(--device "${DEVICE}")
 
 python -m lhg.teacher \
     --tracked-params "${TRACKED_PARAMS}" \

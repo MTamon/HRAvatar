@@ -12,9 +12,9 @@ training tooling consumes.
 
 Layout mapping (mirror of ``render_adapter.features_to_tracked_params``):
 
-    LHGFeatures.expression       <-  tracked_params[frame].expcode[0, :50]
-    LHGFeatures.jaw              <-  tracked_params[frame].fullposecode[0, 6:9]
-    LHGFeatures.eyelid           <-  tracked_params[frame].eyelids
+    LHGFeatures.expression       <-  see "expression source" below
+    LHGFeatures.jaw              <-  see "expression source" below
+    LHGFeatures.eyelid           <-  see "expression source" below
     LHGFeatures.global_rot       <-  tracked_params[frame].fullposecode[0, 0:3]
     LHGFeatures.translation      <-  tracked_params[frame].translation[0]
     LHGFeatures.neck_pose        <-  tracked_params[frame].fullposecode[0, 3:6]
@@ -26,6 +26,26 @@ Layout mapping (mirror of ``render_adapter.features_to_tracked_params``):
     LHGFeatures.interpolated_mask <- all False (no dropout interpolation offline)
     LHGFeatures.rejected_mask    <-  all False (no Hampel reject offline)
     LHGFeatures.mode             <-  'offline_teacher'
+
+Expression source
+-----------------
+Two modes, selected by the presence of ``--avatar-checkpoint``:
+
+* **Default** (no ``--avatar-checkpoint``): expression / jaw / eyelid are
+  read from ``tracked_params[frame].expcode`` / ``fullposecode[6:9]`` /
+  ``eyelids`` — the DECA optimize joint-Adam output. Backwards-compatible
+  with the 5/14 ``[add] LHG teacher data builder`` commit.
+
+* **Avatar-trained SMIRK** (``--avatar-checkpoint <dir>`` set): expression
+  / jaw / eyelid are recomputed per-frame by running the avatar's own
+  trained ``FlameParamsNetSmirk`` (loaded from
+  ``<dir>/flame_params_net.pth``) on the 224x224 warped face crop derived
+  from ``stable_bbox.npz``. This is what the renderer actually consumes
+  at avatar training time (``scene/gaussian_head_model.py:364-382``
+  overwrites the external ``expression_param`` / ``jaw_params`` /
+  ``eyelid_param`` with the SMIRK output when ``warped_image is not
+  None``), so it is the right teacher target for the 2026-05-14 grand
+  design (memory ``project_lhg_grand_design``).
 
 ``shapecode`` does not have a slot in ``LHGFeatures``. It is written
 alongside the npz as a sidecar JSON file ``<output>.shapecode.json`` so
@@ -69,6 +89,152 @@ def _natural_sorted_frame_keys(payload: dict) -> list[str]:
     return sorted(image_keys, key=lambda k: (len(k), k))
 
 
+def _warp_frame_to_224(
+    image_path: Path, tform_3x3: np.ndarray,
+) -> np.ndarray:
+    """Warp one image with the stable_bbox tform to a 224x224 uint8 crop.
+
+    Bit-equivalent with ``scene/data_loader.py:_load_images`` (L354 +
+    L375): float ``warp(..., preserve_range=True)`` followed by the
+    ``((*255).astype(uint8))/255.0`` two-step quantisation. The result
+    is what HRAvatar's SMIRK module receives at avatar training time,
+    so feeding this through the same SMIRK at teacher-build time
+    reproduces the renderer's per-frame expression/jaw/eyelid output.
+    """
+    import cv2
+    from skimage.transform import warp, SimilarityTransform
+
+    img_bgr = cv2.imread(str(image_path))
+    if img_bgr is None:
+        raise FileNotFoundError(f'could not read image {image_path}')
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img01 = img_rgb.astype(np.float32) / 255.0
+    tform = SimilarityTransform(matrix=np.asarray(tform_3x3, dtype=np.float64))
+    warped01 = warp(img01, tform.inverse, output_shape=(224, 224),
+                    preserve_range=True)
+    # Two-step quantisation matching data_loader.py:375. This keeps the
+    # SMIRK input numerically identical to what avatar training saw.
+    warped_u8 = (warped01 * 255.0).clip(0, 255).astype(np.uint8)
+    return warped_u8
+
+
+def _load_stable_bbox(
+    subject_dir: Path, prefer_raw: bool = True,
+) -> tuple[dict[str, np.ndarray], str, Path]:
+    """Resolve the stable_bbox tform table for SMIRK warp.
+
+    Returns ``(basename_to_tform, coord_system, source_image_dir)``.
+
+    Branching matches ``scene/data_loader.py:_load_images`` (L321-354):
+    prefer ``stable_bbox_raw.npz`` + ``image_raw/`` when available (the
+    raw-resolution path the avatar's renderer uses when image_raw/
+    exists), fall back to ``stable_bbox.npz`` + ``image/`` otherwise.
+    """
+    raw_npz = subject_dir / 'stable_bbox_raw.npz'
+    raw_dir = subject_dir / 'image_raw'
+    outer_npz = subject_dir / 'stable_bbox.npz'
+    outer_dir = subject_dir / 'image'
+
+    if prefer_raw and raw_npz.is_file() and raw_dir.is_dir():
+        npz_path = raw_npz
+        source_dir = raw_dir
+    elif outer_npz.is_file() and outer_dir.is_dir():
+        npz_path = outer_npz
+        source_dir = outer_dir
+    elif raw_npz.is_file() and raw_dir.is_dir():
+        npz_path = raw_npz
+        source_dir = raw_dir
+    else:
+        raise FileNotFoundError(
+            f'No stable_bbox.npz / stable_bbox_raw.npz with matching '
+            f'image dir found under {subject_dir}. Stage 1 of the '
+            f'avatar fit pipeline must have run already (it writes '
+            f'these files).')
+
+    with np.load(npz_path, allow_pickle=False) as npz:
+        basenames = [str(b) for b in npz['frame_basenames']]
+        tforms = npz['tform'].astype(np.float64)
+        if 'coord_system' in npz.files:
+            coord_system = str(npz['coord_system'])
+        else:
+            coord_system = 'outer_512' if 'outer' in npz_path.stem else 'raw'
+
+    basename_to_tform = {b: tforms[i] for i, b in enumerate(basenames)}
+    return basename_to_tform, coord_system, source_dir
+
+
+def _recompute_expression_jaw_eyelid_via_smirk(
+    subject_dir: Path,
+    avatar_checkpoint: Path,
+    frame_basenames: list[str],
+    *,
+    batch_size: int = 16,
+    device: str = 'cuda',
+    prefer_raw: bool = True,
+    progress_cb=None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Re-run the avatar's trained SMIRK module on every frame and
+    return ``(expression, jaw, eyelid, info)``.
+
+    Where:
+      * ``expression`` (N, 50) float32
+      * ``jaw`` (N, 3) float32
+      * ``eyelid`` (N, 2) float32
+      * ``info`` dict with diagnostic metadata (coord_system,
+        source_dir, batch_size, n_frames).
+
+    The 224 warp is reproduced from ``stable_bbox.npz`` exactly the
+    way ``scene/data_loader.py`` does at avatar-training time, so the
+    SMIRK output here matches what the renderer received during avatar
+    training.
+    """
+    from lhg.encoders import SMIRKEncoder
+
+    bb_map, coord_system, source_dir = _load_stable_bbox(
+        subject_dir, prefer_raw=prefer_raw)
+
+    # Cross-check frame ordering between tracked_params and stable_bbox.
+    missing = [b for b in frame_basenames if b not in bb_map]
+    if missing:
+        head = ', '.join(missing[:3])
+        raise RuntimeError(
+            f'{len(missing)} frame(s) listed in tracked_params.json have no '
+            f'matching tform in stable_bbox(_raw).npz (first missing: {head}). '
+            f'Re-run Stage 1 with --no-stable-bbox disabled, or check that '
+            f'tracked_params and stable_bbox were written from the same clip.')
+
+    encoder = SMIRKEncoder(device=device, avatar_checkpoint=avatar_checkpoint)
+
+    n = len(frame_basenames)
+    expression = np.zeros((n, 50), dtype=np.float32)
+    jaw = np.zeros((n, 3), dtype=np.float32)
+    eyelid = np.zeros((n, 2), dtype=np.float32)
+
+    i = 0
+    while i < n:
+        bsz = min(batch_size, n - i)
+        batch = np.empty((bsz, 224, 224, 3), dtype=np.uint8)
+        for j in range(bsz):
+            basename = frame_basenames[i + j]
+            tform = bb_map[basename]
+            batch[j] = _warp_frame_to_224(source_dir / basename, tform)
+        out = encoder.encode_batch(batch)
+        expression[i:i + bsz] = out['expression']
+        jaw[i:i + bsz] = out['jaw']
+        eyelid[i:i + bsz] = out['eyelid']
+        i += bsz
+        if progress_cb is not None:
+            progress_cb(i, n)
+
+    info = {
+        'coord_system': coord_system,
+        'source_dir': str(source_dir),
+        'batch_size': int(batch_size),
+        'n_frames': int(n),
+    }
+    return expression, jaw, eyelid, info
+
+
 def _resolve_outer_bbox(
     tracked_params_path: Path, image_size: int,
 ) -> np.ndarray:
@@ -96,6 +262,12 @@ def build_features_from_tracked_params(
     fps: float = 25.0,
     image_size: int = 512,
     expression_dim: int = 50,
+    avatar_checkpoint: str | Path | None = None,
+    subject_dir: str | Path | None = None,
+    prefer_raw_bbox: bool = True,
+    smirk_batch_size: int = 16,
+    device: str = 'cuda',
+    progress_cb=None,
 ):
     """Read ``tracked_params.json`` and return an ``LHGFeatures`` instance.
 
@@ -111,6 +283,24 @@ def build_features_from_tracked_params(
     expression_dim : number of expression dims to keep from the offline
         ``expcode`` (HRAvatar stores 100d, SMIRK consumes the first
         50d). Default 50 matches ``LHGFeatures.expression`` shape.
+    avatar_checkpoint : path to the avatar's checkpoint directory
+        containing ``flame_params_net.pth``. When provided, expression
+        / jaw / eyelid are recomputed by running the avatar's trained
+        SMIRK module on the 224x224 warped face crop (matches the
+        renderer's actual per-frame consumption). When ``None``
+        (default) the legacy behaviour applies: expression / jaw /
+        eyelid come from ``tracked_params.json`` (DECA optimize).
+    subject_dir : directory holding ``stable_bbox.npz`` /
+        ``stable_bbox_raw.npz`` and ``image/`` / ``image_raw/``.
+        Defaults to the parent directory of ``tracked_params_path``.
+        Only consulted when ``avatar_checkpoint`` is set.
+    prefer_raw_bbox : when True (default), prefer
+        ``stable_bbox_raw.npz`` + ``image_raw/`` over ``stable_bbox.npz``
+        + ``image/`` (matches ``scene/data_loader.py`` branching).
+    smirk_batch_size : forward batch size when recomputing SMIRK.
+    device : compute device for SMIRK (default ``'cuda'``).
+    progress_cb : optional callable ``(i, n) -> None`` invoked during
+        the SMIRK recompute loop.
     """
     # Import here so the CLI can be imported as a library without
     # forcing the full lhg dependency tree.
@@ -169,6 +359,55 @@ def build_features_from_tracked_params(
 
     outer_bbox = _resolve_outer_bbox(tracked_params_path, image_size)
 
+    expression_source = 'tracked_params_expcode'
+    smirk_info: dict | None = None
+    if avatar_checkpoint is not None:
+        # Recompute expression / jaw / eyelid using the avatar's
+        # trained SMIRK module — this is what the renderer actually
+        # consumes (see ``project_lhg_grand_design`` memory). The
+        # other channels (global_rot / neck / eye_pose / translation /
+        # shape / world_mat / intrinsics) continue to come from
+        # tracked_params.json because DECA optimize handles those
+        # and the renderer reads them directly.
+        sd = (
+            Path(subject_dir) if subject_dir is not None
+            else tracked_params_path.parent
+        )
+        smirk_exp, smirk_jaw, smirk_eyelid, smirk_info = (
+            _recompute_expression_jaw_eyelid_via_smirk(
+                subject_dir=sd,
+                avatar_checkpoint=Path(avatar_checkpoint),
+                frame_basenames=frame_keys,
+                batch_size=smirk_batch_size,
+                device=device,
+                prefer_raw=prefer_raw_bbox,
+                progress_cb=progress_cb,
+            )
+        )
+        # SMIRK natively emits a 50-d expression vector; pad / trim
+        # to ``expression_dim`` to stay schema-compatible.
+        if smirk_exp.shape[1] == expression_dim:
+            expression = smirk_exp
+        elif smirk_exp.shape[1] < expression_dim:
+            expression = np.zeros((n, expression_dim), dtype=np.float32)
+            expression[:, :smirk_exp.shape[1]] = smirk_exp
+        else:
+            expression = smirk_exp[:, :expression_dim].astype(np.float32)
+        jaw = smirk_jaw
+        eyelid = smirk_eyelid
+        expression_source = f'avatar_smirk@{avatar_checkpoint}'
+
+    metadata = {
+        'avatar_shapecode': calibration.shapecode.astype(np.float32).tolist(),
+        'source_tracked_params': str(tracked_params_path),
+        'generator': 'lhg.teacher',
+        'expression_source': expression_source,
+    }
+    if smirk_info is not None:
+        metadata['smirk_coord_system'] = smirk_info['coord_system']
+        metadata['smirk_source_dir'] = smirk_info['source_dir']
+        metadata['smirk_batch_size'] = smirk_info['batch_size']
+
     return LHGFeatures(
         frame_basenames=np.array(frame_keys, dtype=str),
         expression=expression,
@@ -189,11 +428,7 @@ def build_features_from_tracked_params(
         image_size=int(image_size),
         flame_scale=float(calibration.flame_scale),
         camera_convention='hravatar',
-        metadata={
-            'avatar_shapecode': calibration.shapecode.astype(np.float32).tolist(),
-            'source_tracked_params': str(tracked_params_path),
-            'generator': 'lhg.teacher',
-        },
+        metadata=metadata,
     )
 
 
@@ -254,6 +489,39 @@ def build_parser() -> argparse.ArgumentParser:
         help='Number of expression dims to keep from the offline expcode '
              '(default 50, matching SMIRK / LHGFeatures.expression).',
     )
+    p.add_argument(
+        '--avatar-checkpoint', default=None,
+        help='Path to the avatar checkpoint directory containing '
+             '``flame_params_net.pth`` (typically '
+             '``outputs/custom/<avatar>/saved_model/epoch_<E>``). When '
+             'set, expression / jaw / eyelid are recomputed by running '
+             'the avatar\'s trained SMIRK module on the 224x224 warped '
+             'crop from stable_bbox.npz — this matches what the renderer '
+             'consumes at avatar training time, and is the right teacher '
+             'target under the 2026-05-14 grand design. When omitted, '
+             'expression / jaw / eyelid come from tracked_params.json '
+             '(DECA optimize joint output) for backwards compatibility.',
+    )
+    p.add_argument(
+        '--subject-dir', default=None,
+        help='Directory holding stable_bbox.npz / stable_bbox_raw.npz and '
+             'image/ / image_raw/ (defaults to the parent of '
+             '--tracked-params). Consulted only with --avatar-checkpoint.',
+    )
+    p.add_argument(
+        '--prefer-outer-bbox', action='store_true',
+        help='Use stable_bbox.npz + image/ even when stable_bbox_raw.npz + '
+             'image_raw/ exist. By default the raw-resolution pair is '
+             'preferred (matches scene/data_loader.py:_load_images).',
+    )
+    p.add_argument(
+        '--smirk-batch-size', type=int, default=16,
+        help='Forward batch size when recomputing SMIRK (default 16).',
+    )
+    p.add_argument(
+        '--device', default='cuda',
+        help='Compute device for SMIRK forward (default cuda).',
+    )
     return p
 
 
@@ -264,17 +532,42 @@ def main(argv: list[str] | None = None) -> int:
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
+    progress_cb = None
+    if args.avatar_checkpoint is not None:
+        try:
+            from tqdm import tqdm
+            bar_state = {'bar': None}
+
+            def progress_cb(i: int, n: int) -> None:
+                if bar_state['bar'] is None or bar_state['bar'].total != n:
+                    if bar_state['bar'] is not None:
+                        bar_state['bar'].close()
+                    bar_state['bar'] = tqdm(total=n, desc='teacher/smirk')
+                bar = bar_state['bar']
+                delta = i - bar.n
+                if delta > 0:
+                    bar.update(delta)
+        except ImportError:
+            progress_cb = None
+
     features = build_features_from_tracked_params(
         tracked_params_path=args.tracked_params,
         fps=args.fps,
         image_size=args.image_size,
         expression_dim=args.expression_dim,
+        avatar_checkpoint=args.avatar_checkpoint,
+        subject_dir=args.subject_dir,
+        prefer_raw_bbox=not args.prefer_outer_bbox,
+        smirk_batch_size=args.smirk_batch_size,
+        device=args.device,
+        progress_cb=progress_cb,
     )
     features.write(args.output)
     sidecar = write_shapecode_sidecar(features, args.output)
     print(
         f'wrote {args.output}  '
         f'(N={features.frame_basenames.shape[0]}, mode={features.mode}, '
+        f'expression_source={features.metadata.get("expression_source")}, '
         f'shapecode-sidecar={sidecar})'
     )
     return 0
