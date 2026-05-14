@@ -35,7 +35,9 @@ import numpy as np
 CameraConvention = Literal['opencv', 'hravatar']
 
 # Diagonal sign-flip matrix for OpenCV → HRAvatar conversion.
-# Applied to both translation vector and the 3D rotation axis.
+# M = diag(1, -1, -1) maps OpenCV camera coordinates to HRAvatar:
+# the y and z axes flip (OpenCV: y-down, +z-forward; HRAvatar: y-up,
+# -z-forward). M is its own inverse.
 _CV_TO_HR_DIAG = np.array([1.0, -1.0, -1.0], dtype=np.float64)
 
 
@@ -44,16 +46,31 @@ def convert_pose_opencv_to_hravatar(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert an OpenCV (rvec, tvec) pair to HRAvatar/OpenGL convention.
 
-    Both inputs are 1-D arrays of length 3. The translation is
-    elementwise multiplied by diag(1, -1, -1). The axis-angle rotation
-    is rotated similarly: M @ R_cv @ M can be expressed in axis-angle
-    form by flipping the same components of the axis (because conjugation
-    by a diagonal sign matrix flips the off-diagonal block of R, which
-    in axis-angle space is exactly the corresponding axis components).
+    The OpenCV solver returns ``(R_cv, t_cv)`` such that a point in
+    object frame maps to OpenCV-camera coordinates via
+    ``p_cv = R_cv @ p_obj + t_cv``. The same physical transform in
+    HRAvatar-camera coordinates is ``p_hr = M @ p_cv = (M @ R_cv) @
+    p_obj + M @ t_cv``, where ``M = diag(1, -1, -1)``. Therefore:
+
+        R_hr = M @ R_cv        (pre-multiply, NOT conjugation)
+        t_hr = M @ t_cv
+
+    The object frame itself is unchanged (FLAME canonical is already
+    y-up); only the destination camera frame switches. Note this is
+    NOT the symmetric ``M @ R_cv @ M`` form — that would apply when
+    both the object frame AND the camera frame are rotating, which is
+    not the case here.
     """
+    import cv2
+
     rvec_cv = np.asarray(rvec_cv, dtype=np.float64).reshape(3)
     tvec_cv = np.asarray(tvec_cv, dtype=np.float64).reshape(3)
-    return rvec_cv * _CV_TO_HR_DIAG, tvec_cv * _CV_TO_HR_DIAG
+    R_cv, _ = cv2.Rodrigues(rvec_cv)
+    M = np.diag(_CV_TO_HR_DIAG)
+    R_hr = M @ R_cv
+    rvec_hr, _ = cv2.Rodrigues(R_hr)
+    tvec_hr = tvec_cv * _CV_TO_HR_DIAG
+    return rvec_hr.reshape(3), tvec_hr
 
 
 def solve_epnp(

@@ -112,3 +112,62 @@ def load(path: str | Path = DEFAULT_ASSET) -> MediaPipeFLAMECorrespondence:
                 canonical.astype(np.float64) if canonical is not None else None
             ),
         )
+
+
+DEFAULT_FLAME_MODEL_PATH = Path('./assets/FLAME2020/generic_model.pkl')
+
+
+def build_shape_aware_landmarks(
+    correspondence: MediaPipeFLAMECorrespondence,
+    shapecode: np.ndarray,
+    flame_model_path: str | Path = DEFAULT_FLAME_MODEL_PATH,
+) -> np.ndarray:
+    """Compute the per-subject 3D landmark positions from a Stage 1 shapecode.
+
+    EPnP fits a fixed 3D template to the observed 2D points to recover
+    pose + depth. If the template is the FLAME *neutral* mesh but the
+    subject's true mesh is e.g. 3x narrower (large shape coefficients),
+    EPnP compensates by pushing the camera ~3x farther away, producing
+    a systematically biased ``tvec``. Applying the Stage 1 shapecode
+    here removes that bias.
+
+    The computation evaluates a single FLAME forward pass at
+    ``expression=0`` and ``pose=0`` (so the result is invariant to
+    per-frame motion), then maps the per-vertex tensor through the
+    landmark barycentric mapping. pose blendshape and LBS contributions
+    are zero in this canonical state, so plain ``v_template +
+    shapedirs @ shapecode`` is exact.
+    """
+    import pickle
+
+    path = Path(flame_model_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'FLAME model not found: {path}. Required for shape-aware EPnP. '
+            f'Place ``generic_model.pkl`` from FLAME 2020 release at this '
+            f'path, or pass ``flame_model_path`` explicitly.')
+    with open(path, 'rb') as f:
+        fm = pickle.load(f, encoding='latin1')
+
+    def _to_np(x):
+        return np.asarray(x.r) if hasattr(x, 'r') else np.asarray(x)
+
+    v_template = _to_np(fm['v_template'])           # (V, 3)
+    shapedirs = _to_np(fm['shapedirs'])             # (V, 3, 300+100)
+    faces = _to_np(fm['f']).astype(np.int64)        # (F, 3)
+
+    shape_coeffs = np.asarray(shapecode, dtype=np.float64).reshape(-1)
+    n_shape = shape_coeffs.size
+    if n_shape > shapedirs.shape[2]:
+        raise ValueError(
+            f'shapecode length {n_shape} exceeds shapedirs capacity '
+            f'{shapedirs.shape[2]}')
+    shape_blend = np.einsum('vsd,d->vs', shapedirs[:, :, :n_shape], shape_coeffs)
+    verts = (v_template + shape_blend).astype(np.float64)
+
+    tri = faces[correspondence.flame_face_idx]      # (K, 3)
+    v0 = verts[tri[:, 0]]
+    v1 = verts[tri[:, 1]]
+    v2 = verts[tri[:, 2]]
+    b = correspondence.flame_bary
+    return (b[:, 0:1] * v0 + b[:, 1:2] * v1 + b[:, 2:3] * v2).astype(np.float64)

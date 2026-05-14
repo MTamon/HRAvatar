@@ -1,26 +1,35 @@
 """Per-frame core algorithm and mode-specific orchestration.
 
-The two modes share one ``per_frame_core`` step (MediaPipe → stable
-bbox → SMIRK → EPnP → causal Hampel) and differ only in the surrounding
-clip-level wrapper:
+The two modes share one ``per_frame_core`` step (detector → stable
+bbox → SMIRK → EPnP → causal Hampel) and differ only in the
+surrounding clip-level wrapper:
 
 * ``online`` runs the core strictly causally and yields one frame at a
-  time. Detector dropouts are held at the previous valid value.
+  time. Detector dropouts are held at the previous valid value. After
+  the per-frame loop, a symmetric (zero-phase) FIR LPF is applied to
+  rotation/translation (and optionally jaw) — mathematically
+  equivalent to a streaming filter with lookahead ``L`` frames, since
+  we have the full clip in hand at extraction time.
 
-* ``pseudo-online`` runs the core in the same order but post-processes
-  the collected sequence with bidirectional Hampel + linear
-  interpolation across detector dropouts + bidirectional quaternion-flip
-  fix.
+* ``pseudo-online`` (Stage 3, gated in ``lhg.extract``) runs the core
+  in the same order but post-processes the collected sequence with
+  bidirectional Hampel + linear interpolation across detector
+  dropouts + bidirectional quaternion-flip fix + a wider LPF.
 
-The post-processing in ``pseudo-online`` is restricted to the four
-limited cases listed in ``feedback_pseudo_online_for_lhg_teacher.md`` —
-no smoothing of in-range values, no future-info access for normal
-frames.
+Camera/world-mat handling
+-------------------------
+The Stage 1 calibration (DECA optimize.py joint fit) provides the
+``world_mat`` and ``shapecode`` clip-constants. Per-frame
+``global_rot`` and ``translation`` are emitted as DELTAS around
+``world_mat``, so the downstream LHG model sees only motion (not
+absolute pose). The per-frame EPnP could not reproduce the
+calibration's clip-wide accuracy in any case, so this layered design
+splits the work cleanly: calibration handles absolute pose, Stage 2
+handles per-frame deltas.
 """
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -32,6 +41,7 @@ from preprocess._smirk_constants import (
     STABLE_LANDMARK_SIZE_CALIBRATION,
 )
 
+from .calibration import StageOneCalibration, load_stage_one_calibration
 from .config import LHGConfig, intrinsics_matrix
 from .correspondence import MediaPipeFLAMECorrespondence
 from .detector import MediaPipeFaceLandmarker
@@ -44,20 +54,29 @@ from .epnp import (
 )
 from .hampel import CausalHampel, bidirectional_hampel
 from .interpolate import linear_interpolate_dropouts
+from .lpf import apply_offline_zero_phase
 from .output import LHGFeatures
-from .video import FrameSource, load_outer_offset
+from .video import FrameSource
 
 
 @dataclass
 class _BboxState:
-    """Causal hysteresis follower state (per stable_bbox.py:_hysteresis_forward)
-    plus optional FAN-detector bbox seed (constant across the clip)."""
+    """Causal hysteresis follower state plus per-detector bbox tracker.
+
+    ``anchor`` / ``target`` / ``ring`` / ``ring_idx`` / ``initialized``
+    follow ``preprocess.stable_bbox._hysteresis_forward`` for the
+    SMIRK 224-crop center. ``fan_bbox`` is the *next-frame* xyxy bbox
+    used to bypass FAN's internal S3FD on subsequent frames; it's
+    updated at the END of each iteration from the current frame's
+    detected landmarks (with 25% padding) so subject motion is
+    followed without re-running S3FD.
+    """
     anchor: np.ndarray              # (2,) current emitted center
     target: np.ndarray              # (2,) candidate to chase
     ring: np.ndarray                # (window,) bool sliding history
     ring_idx: int = 0
     initialized: bool = False
-    fan_bbox: np.ndarray | None = None  # (4,) [x1, y1, x2, y2] for FAN, seeded once
+    fan_bbox: np.ndarray | None = None  # (4,) [x1, y1, x2, y2] for FAN
 
 
 def _step_bbox_hysteresis(
@@ -86,12 +105,6 @@ def _step_bbox_hysteresis(
 
     k_thresh = max(1, min(int(cfg.bbox_k_of_n), state.ring.size))
     if int(state.ring.sum()) >= k_thresh:
-        # When the K-of-N condition fires we'd ideally average the last
-        # `window` raw centers; in the streaming setting we only have
-        # the current one, so we use the raw center as the new target.
-        # (The avatar fit path averages the last `window` raws but that
-        # requires a per-frame raw-center buffer; for LHG the practical
-        # difference is sub-pixel and the ring length is small.)
         state.target = raw_center.astype(np.float64).copy()
 
     state.anchor = state.anchor + (state.target - state.anchor) * alpha
@@ -134,6 +147,28 @@ def _bbox_size_from_landmarks(
         [(left + right) / 2.0, (top + bottom) / 2.0], dtype=np.float64,
     )
     return center, float(size)
+
+
+def _fan_bbox_from_landmarks(
+    landmarks: np.ndarray, padding_frac: float = 0.25,
+) -> np.ndarray:
+    """Tight FAN-input bbox from the current frame's 68 landmarks.
+
+    The bbox is inflated by ``padding_frac`` (default 25%) so the next
+    frame's face — which may have moved by a few px due to head /
+    body motion — still falls comfortably inside. The 25% margin is
+    much smaller than the full 512x512 frame, keeping the face at
+    ~195 px in FAN's 256-input (the model's optimal scale).
+    """
+    xs, ys = landmarks[:, 0], landmarks[:, 1]
+    x1, x2 = float(xs.min()), float(xs.max())
+    y1, y2 = float(ys.min()), float(ys.max())
+    w_pad = (x2 - x1) * padding_frac
+    h_pad = (y2 - y1) * padding_frac
+    return np.array(
+        [x1 - w_pad, y1 - h_pad, x2 + w_pad, y2 + h_pad],
+        dtype=np.float64,
+    )
 
 
 def _warp_to_224(
@@ -181,7 +216,33 @@ class FrameTrace:
     translation: np.ndarray | None = None      # (3,) FLAME canonical
     bbox_center: np.ndarray | None = None      # (2,)
     bbox_size: float | None = None
-    valid: bool = False                        # True iff MediaPipe + EPnP succeeded
+    valid: bool = False                        # True iff detector + EPnP succeeded
+
+
+def _detect_landmarks(
+    image_outer_rgb: np.ndarray,
+    detector,
+    bbox_state: _BboxState,
+    cfg: LHGConfig,
+    frame_index: int,
+) -> np.ndarray | None:
+    """Wrapper that dispatches to the per-detector calling convention.
+
+    For ``mediapipe`` in video mode we synthesize an integer
+    ``timestamp_ms`` from ``frame_index / cfg.fps`` so the internal
+    Kalman tracker sees monotonically-increasing timestamps. For
+    ``fan`` we feed the previous frame's tight-bbox-with-padding to
+    bypass S3FD; the first frame triggers FAN's internal S3FD seed.
+    """
+    if cfg.detector_type == 'mediapipe':
+        if cfg.mediapipe_running_mode == 'video':
+            timestamp_ms = int(frame_index * 1000.0 / float(cfg.fps))
+            return detector.detect(image_outer_rgb, timestamp_ms=timestamp_ms)
+        return detector.detect(image_outer_rgb)
+    if cfg.detector_type == 'fan':
+        bbox = getattr(bbox_state, 'fan_bbox', None)
+        return detector.detect(image_outer_rgb, bbox_xyxy=bbox)
+    raise ValueError(f'unknown detector_type {cfg.detector_type!r}')
 
 
 def per_frame_core(
@@ -193,52 +254,24 @@ def per_frame_core(
     cfg: LHGConfig,
     bbox_state: _BboxState,
     last_valid: FrameTrace | None,
+    frame_index: int,
+    epnp_object_points: np.ndarray | None = None,
 ) -> FrameTrace:
     """One causal frame step. Shared by online and pseudo-online modes.
 
-    ``detector`` is duck-typed: any object with a ``.detect(rgb)``
-    returning either ``None`` or an ``(N, 2)`` landmark array works
-    (currently MediaPipe 478-pt or FAN 68-pt).
-
-    The only inter-frame state used here is ``bbox_state`` (causal
-    hysteresis follower) and ``last_valid`` (used to hold values across
-    a detector dropout). Hampel rejection happens one level up.
+    The only inter-frame state is ``bbox_state`` (causal hysteresis
+    follower + FAN bbox tracker) and ``last_valid`` (used to hold
+    values across a detector dropout). Hampel rejection happens one
+    level up.
     """
-    # For FAN: skip per-frame S3FD detection by passing a TIGHT, fixed
-    # bbox sized to the actual face. S3FD's bbox would otherwise wobble
-    # ~5 px frame-to-frame even on a still face, and any bbox shift
-    # propagates into 2-3 px landmark jitter; conversely a bbox that
-    # is too LOOSE (e.g. the full 512x512 image) makes the face occupy
-    # ~75 px in the 256-input 2DFAN, well below the model's optimal
-    # ~195 px scale, sharply degrading landmark accuracy.
-    #
-    # We seed the fixed bbox from the first valid frame (FAN-auto-
-    # detect once) and reuse it across the clip. ``bbox_state.fan_bbox``
-    # holds the persistent value; on the first call it's None and the
-    # auto-detect pass populates it.
-    if cfg.detector_type == 'fan':
-        if getattr(bbox_state, 'fan_bbox', None) is not None:
-            landmarks = detector.detect(
-                image_outer_rgb, bbox_xyxy=bbox_state.fan_bbox,
-            )
-        else:
-            landmarks = detector.detect(image_outer_rgb)
-            if landmarks is not None:
-                # Compute a tight bbox from this frame's landmarks +
-                # 25% margin and freeze it for subsequent frames.
-                xs, ys = landmarks[:, 0], landmarks[:, 1]
-                x1, x2 = float(xs.min()), float(xs.max())
-                y1, y2 = float(ys.min()), float(ys.max())
-                w_pad = (x2 - x1) * 0.25
-                h_pad = (y2 - y1) * 0.25
-                bbox_state.fan_bbox = np.array(
-                    [x1 - w_pad, y1 - h_pad, x2 + w_pad, y2 + h_pad],
-                    dtype=np.float64,
-                )
-    else:
-        landmarks = detector.detect(image_outer_rgb)
+    landmarks = _detect_landmarks(
+        image_outer_rgb, detector, bbox_state, cfg, frame_index,
+    )
+
     if landmarks is None:
         # Detector miss: hold previous valid sample if available.
+        # Note: bbox_state.fan_bbox is intentionally NOT updated this
+        # frame, so the next frame retries with the same prior bbox.
         if last_valid is None:
             return FrameTrace(valid=False)
         return FrameTrace(
@@ -252,6 +285,13 @@ def per_frame_core(
             valid=False,
         )
 
+    # FAN bbox tracking: update from THIS frame's landmarks so the
+    # NEXT frame's FAN call has a tight bbox at this frame's face
+    # location. Even with subject motion the face will be inside the
+    # 25%-padded bbox at the next frame.
+    if cfg.detector_type == 'fan':
+        bbox_state.fan_bbox = _fan_bbox_from_landmarks(landmarks)
+
     raw_center, raw_size = _bbox_size_from_landmarks(landmarks, cfg.detector_type)
     smoothed_center = _step_bbox_hysteresis(bbox_state, raw_center, cfg)
 
@@ -261,14 +301,21 @@ def per_frame_core(
     smirk_out = smirk.encode(face_224)
 
     img_pts_2d = landmarks[correspondence.mp_indices]
-    if correspondence.flame_canonical_xyz is None:
+    object_points = (
+        epnp_object_points
+        if epnp_object_points is not None
+        else correspondence.flame_canonical_xyz
+    )
+    if object_points is None:
         raise RuntimeError(
-            'correspondence.flame_canonical_xyz is None; LHG EPnP solve '
-            'requires the precomputed canonical landmark positions. Re-build '
-            'the correspondence asset with --include-canonical.')
+            'No 3D landmark positions available for EPnP. Either pass '
+            '``epnp_object_points`` (preferred — built from Stage 1 '
+            'shapecode via build_shape_aware_landmarks) or ensure the '
+            'correspondence asset carries ``flame_canonical_xyz`` (neutral '
+            'mesh fallback).')
     rvec, tvec_canonical, ok = solve_epnp(
         img_pts_2d,
-        correspondence.flame_canonical_xyz,
+        object_points,
         K,
         cfg.flame_scale,
         camera_convention=cfg.camera_convention,
@@ -335,44 +382,6 @@ def _crop_outer(image_raw_rgb: np.ndarray, outer_bbox: np.ndarray, image_size: i
     return canvas
 
 
-def _compute_outer_bbox_from_landmarks(
-    landmarks_per_frame: list[np.ndarray | None],
-    image_shape_hw: tuple[int, int],
-    bbox_scale: float = 2.2,
-) -> np.ndarray:
-    """Mirror ``crop_and_matting._compute_video_wide_outer_bbox`` from
-    a precomputed list of landmark arrays. Used for pseudo-online's
-    clip-wide outer crop.
-    """
-    x_mins, x_maxs, y_mins, y_maxs = [], [], [], []
-    for lm in landmarks_per_frame:
-        if lm is None:
-            continue
-        x_mins.append(float(np.min(lm[:, 0])))
-        x_maxs.append(float(np.max(lm[:, 0])))
-        y_mins.append(float(np.min(lm[:, 1])))
-        y_maxs.append(float(np.max(lm[:, 1])))
-    if not x_mins:
-        raise RuntimeError(
-            'no successful MediaPipe detections in the entire clip; cannot '
-            'compute clip-wide outer bbox')
-    u_xmin, u_xmax = min(x_mins), max(x_maxs)
-    u_ymin, u_ymax = min(y_mins), max(y_maxs)
-    cx = int(round((u_xmin + u_xmax) / 2.0))
-    cy = int(round((u_ymin + u_ymax) / 2.0))
-    half_extent = max((u_xmax - u_xmin) / 2.0, (u_ymax - u_ymin) / 2.0)
-    size = int(bbox_scale * 2 * half_extent)
-    xb_min = cx - size // 2
-    xb_max = cx + size // 2
-    yb_min = cy - size // 2
-    yb_max = cy + size // 2
-    if (xb_max - xb_min) % 2 != 0:
-        xb_min += 1
-    if (yb_max - yb_min) % 2 != 0:
-        yb_min += 1
-    return np.array([xb_min, xb_max, yb_min, yb_max], dtype=np.int32)
-
-
 def _axis_angle_to_R(aa: np.ndarray) -> np.ndarray:
     """Convert axis-angle (3,) to 3x3 rotation matrix (numpy Rodrigues)."""
     import cv2
@@ -386,127 +395,51 @@ def _R_to_axis_angle(R: np.ndarray) -> np.ndarray:
     return aa.reshape(3)
 
 
-def _resolve_world_mat_and_recenter(
-    cfg: LHGConfig,
+def _recenter_against_world_mat(
+    world_mat: np.ndarray,
+    flame_scale: float,
     global_rots: np.ndarray,
     translations: np.ndarray,
-    valid: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute the clip-constant world_mat (rotation + translation) AND
-    recenter per-frame global_rot / translation around it.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert per-frame total pose (R_total, t_total) into deltas
+    around the calibration ``world_mat``.
 
-    HRAvatar's renderer convention (matches what DECA ``optimize.py``
-    writes when ``with_translation_camera=False``):
+    HRAvatar's renderer (and DECA's ``optimize.py`` ``projection``)
+    consume per-frame pose as a SMALL delta around ``world_mat``:
 
-    * ``world_mat`` carries the absolute camera-to-mean-head transform
-      (rotation in [:3, :3] absorbs the FLAME-canonical-to-camera-
-      facing pre-rotation; translation in [:3, 3] absorbs the depth).
-    * Per-frame ``global_rot`` is a SMALL axis-angle delta around the
-      reference rotation, applied AFTER the world_mat rotation.
+    * ``world_mat`` carries the absolute camera-to-mean-head
+      transform — rotation in [:3, :3] absorbs the FLAME-canonical-
+      to-camera-facing pre-rotation, translation in [:3, 3] absorbs
+      the depth (in scaled FLAME units).
+    * Per-frame ``global_rot`` is a SMALL axis-angle delta around
+      that reference, applied AFTER the world_mat rotation.
     * Per-frame ``translation`` is a SMALL delta in FLAME canonical
-      units around the reference translation, applied additively to
-      FLAME vertices before the world_mat * flame_scale projection.
+      units (i.e. AFTER dividing the world_mat translation by
+      ``flame_scale``).
 
-    EPnP returns the TOTAL camera-to-object pose on each frame. This
-    routine splits it: the calibration-window reference pose becomes
-    world_mat, and per-frame deltas are recovered via R_delta =
-    R_ref^T @ R_total and t_delta = t_total - t_ref.
-
-    When ``cfg.world_mat_path`` is set we instead load the world_mat
-    from an existing tracked_params.json and recenter against it,
-    keeping LHG output drop-in compatible with the avatar-fit pipeline.
-
-    Returns
-    -------
-    world_mat              : (4, 4) float32
-    global_rot_recentered  : (N, 3) float32 axis-angle deltas
-    translation_recentered : (N, 3) float32 deltas in FLAME canonical units
+    EPnP returns the TOTAL camera-to-object pose on each frame; this
+    routine splits off the calibration reference so the model only
+    sees the residual motion.
     """
-    if cfg.world_mat_path is not None:
-        import json
-
-        path = Path(cfg.world_mat_path)
-        if not path.is_file():
-            raise FileNotFoundError(f'--world-mat file not found: {path}')
-        with open(path) as fp:
-            payload = json.load(fp)
-        if 'world_mat' in payload:
-            wm = np.asarray(payload['world_mat'], dtype=np.float64)
-        elif 'frames' in payload and payload['frames']:
-            wm = np.asarray(payload['frames'][0]['world_mat'], dtype=np.float64)
-        else:
-            frame_keys = [k for k in payload if k.endswith('.png') or k.endswith('.jpg')]
-            if frame_keys:
-                wm = np.asarray(payload[frame_keys[0]]['world_mat'], dtype=np.float64)
-            else:
-                raise RuntimeError(
-                    f'world_mat not found in {path}: expected world_mat at the '
-                    f'top level, frames[0].world_mat, or per-image-key dicts')
-        if wm.shape == (3, 4):
-            wm = np.vstack([wm, [0.0, 0.0, 0.0, 1.0]])
-        R_ref = wm[:3, :3]
-        t_ref_canonical = wm[:3, 3] / float(cfg.flame_scale)
-        # Recenter rotations: R_delta = R_ref^T @ R_total
-        R_ref_T = R_ref.T
-        rot_recentered = np.zeros_like(global_rots, dtype=np.float32)
-        for i in range(global_rots.shape[0]):
-            R_total = _axis_angle_to_R(global_rots[i])
-            R_delta = R_ref_T @ R_total
-            rot_recentered[i] = _R_to_axis_angle(R_delta).astype(np.float32)
-        trans_recentered = translations - t_ref_canonical.astype(translations.dtype)
-        return wm.astype(np.float32), rot_recentered, trans_recentered
-
-    # Calibrate from the first valid frames in the clip.
-    n_calib = max(1, int(cfg.world_mat_calibration_frames))
-    valid_frames = []
-    for i in range(translations.shape[0]):
-        if valid[i]:
-            valid_frames.append(i)
-            if len(valid_frames) >= n_calib:
-                break
-    if not valid_frames:
-        return (
-            np.eye(4, dtype=np.float32),
-            global_rots.astype(np.float32, copy=True),
-            translations.astype(np.float32, copy=True),
-        )
-
-    # Translation reference: arithmetic mean over calibration window.
-    t_ref = translations[valid_frames].astype(np.float64).mean(axis=0)
-
-    # Rotation reference: chordal mean of rotation matrices, then SVD-
-    # project back to SO(3). For ~30-60 frames of a roughly-still head,
-    # this is well within the convergence radius of the chordal mean.
-    R_sum = np.zeros((3, 3), dtype=np.float64)
-    for i in valid_frames:
-        R_sum += _axis_angle_to_R(global_rots[i])
-    R_sum /= len(valid_frames)
-    U, _, Vt = np.linalg.svd(R_sum)
-    R_ref = U @ Vt
-    if np.linalg.det(R_ref) < 0:
-        # Reflect to keep right-handed.
-        U[:, -1] *= -1
-        R_ref = U @ Vt
-
-    wm = np.eye(4, dtype=np.float64)
-    wm[:3, :3] = R_ref
-    wm[:3, 3] = t_ref * float(cfg.flame_scale)
-
-    # Recenter per-frame against the reference.
+    R_ref = world_mat[:3, :3].astype(np.float64)
+    t_ref_canonical = world_mat[:3, 3].astype(np.float64) / float(flame_scale)
     R_ref_T = R_ref.T
     rot_recentered = np.zeros_like(global_rots, dtype=np.float32)
     for i in range(global_rots.shape[0]):
         R_total = _axis_angle_to_R(global_rots[i])
         R_delta = R_ref_T @ R_total
         rot_recentered[i] = _R_to_axis_angle(R_delta).astype(np.float32)
-    trans_recentered = (translations - t_ref.astype(translations.dtype)).astype(np.float32)
-    return wm.astype(np.float32), rot_recentered, trans_recentered
+    trans_recentered = (
+        translations.astype(np.float64) - t_ref_canonical
+    ).astype(np.float32)
+    return rot_recentered, trans_recentered
 
 
 def extract(
     frames: FrameSource,
     outer_bbox: np.ndarray | None,
     cfg: LHGConfig,
+    calibration: StageOneCalibration | None = None,
     correspondence_path: str | Path | None = None,
     progress: Callable[[int, int], None] | None = None,
     apply_outer_crop: bool = True,
@@ -523,18 +456,40 @@ def extract(
         or ``None`` to compute internally.
     apply_outer_crop : if False, skip the in-process outer crop entirely
         — this is the right setting when ``frames`` is already an
-        outer-cropped image directory (the avatar-fit pipeline's
-        ``image/`` folder, with ``outer_offset.json`` describing the
-        historical crop). The outer_bbox value is still passed through
-        to the output as metadata.
+        outer-cropped image directory. The outer_bbox value is still
+        passed through to the output as metadata.
+    calibration : optional Stage 1 calibration. When given (or when
+        ``cfg.calibration_path`` is set, in which case it's loaded
+        here), the world_mat / shapecode / intrinsics from this
+        artifact override per-frame computation. Required for
+        production use; only ``None`` is accepted for diagnostic /
+        unit-test paths that supply a synthetic intrinsics tuple
+        directly via ``cfg``.
     """
     from .correspondence import default_asset_for, load as load_correspondence
+
+    # Resolve calibration.
+    if calibration is None and cfg.calibration_path:
+        calibration = load_stage_one_calibration(cfg.calibration_path)
+    if calibration is None:
+        raise ValueError(
+            'extract() requires either a `calibration` object or '
+            '`cfg.calibration_path`. Run Stage 1 first '
+            '(`bash demos/_preprocess_subject.sh --lhg-only ...`) and '
+            'pass the produced tracked_params.json via `--calibration`.')
+
+    # The calibration is the source of truth for these clip-constants.
+    cfg.intrinsics = calibration.intrinsics_tuple()
+    cfg.flame_scale = float(calibration.flame_scale)
+    world_mat = calibration.world_mat.astype(np.float64)
 
     if cfg.detector_type == 'fan':
         from .detector_fan import FANLandmarker
         detector = FANLandmarker()
     elif cfg.detector_type == 'mediapipe':
-        detector = MediaPipeFaceLandmarker()
+        detector = MediaPipeFaceLandmarker(
+            running_mode=cfg.mediapipe_running_mode,
+        )
     else:
         raise ValueError(f'unknown detector_type {cfg.detector_type!r}')
 
@@ -544,39 +499,35 @@ def extract(
     correspondence = load_correspondence(correspondence_path)
     K = intrinsics_matrix(*cfg.intrinsics)
 
+    # Build shape-aware EPnP object points from the Stage 1 shapecode.
+    # The neutral correspondence asset would bias EPnP's depth estimate by
+    # the ratio of (neutral face width) / (subject face width); see
+    # build_shape_aware_landmarks for the derivation.
+    from .correspondence import build_shape_aware_landmarks
+    epnp_object_points = build_shape_aware_landmarks(
+        correspondence, calibration.shapecode,
+    )
+
     raw_frames_rgb: list[np.ndarray] = list(frames.iter_frames())
     n_total = len(raw_frames_rgb)
+    if n_total == 0:
+        raise RuntimeError('no frames provided to lhg.extract')
 
     # --- Outer crop policy ------------------------------------------
-    # Three cases:
-    # (a) apply_outer_crop=False: input is already outer-cropped
-    #     (e.g. demos/_preprocess_subject.sh's image/ folder). outer_bbox
-    #     is metadata only; we never re-crop.
-    # (b) apply_outer_crop=True, outer_bbox=None: compute it now.
-    # (c) apply_outer_crop=True, outer_bbox given: use it as-is.
+    # (a) apply_outer_crop=False: input is already outer-cropped (e.g.
+    #     demos/_preprocess_subject.sh's image/ folder). outer_bbox is
+    #     metadata only; we never re-crop.
+    # (b) apply_outer_crop=True, outer_bbox=None: use the FULL frame
+    #     extent. We don't compute a clip-wide bbox here anymore;
+    #     callers running on a raw video should pre-crop with
+    #     crop_and_matting.py first (Stage 1 handles this).
+    # (c) apply_outer_crop=True, outer_bbox given: use as-is.
     if not apply_outer_crop and outer_bbox is None:
-        # No metadata supplied — use the frame extent so callers still
-        # get a sensible value persisted to lhg_features.npz.
         h, w = raw_frames_rgb[0].shape[:2]
         outer_bbox = np.array([0, w, 0, h], dtype=np.int32)
     elif apply_outer_crop and outer_bbox is None:
-        if cfg.mode == 'pseudo-online':
-            raw_landmarks: list[np.ndarray | None] = []
-            for i, raw in enumerate(raw_frames_rgb):
-                raw_landmarks.append(detector.detect(raw))
-                if progress is not None:
-                    progress(i, n_total * 2)
-            outer_bbox = _compute_outer_bbox_from_landmarks(
-                raw_landmarks, raw_frames_rgb[0].shape[:2],
-            )
-        else:
-            first_n = min(cfg.world_mat_calibration_frames, n_total)
-            first_landmarks = [
-                detector.detect(raw_frames_rgb[i]) for i in range(first_n)
-            ]
-            outer_bbox = _compute_outer_bbox_from_landmarks(
-                first_landmarks, raw_frames_rgb[0].shape[:2],
-            )
+        h, w = raw_frames_rgb[0].shape[:2]
+        outer_bbox = np.array([0, w, 0, h], dtype=np.int32)
 
     # --- Per-frame causal core --------------------------------------
     bbox_state = _BboxState(
@@ -612,7 +563,8 @@ def extract(
         )
         trace = per_frame_core(
             outer_img, detector, smirk, correspondence, K, cfg,
-            bbox_state, last_valid,
+            bbox_state, last_valid, frame_index=i,
+            epnp_object_points=epnp_object_points,
         )
 
         if trace.valid and trace.global_rot is not None:
@@ -626,8 +578,6 @@ def extract(
                 filtered, rej = causal_filters[name].step(value)
                 if rej:
                     rejected_per_frame[i] = True
-                # Replace in trace so downstream (next iteration's
-                # last_valid, output aggregation) sees the filtered val.
                 if name == 'expression':
                     trace.expression = filtered
                 elif name == 'jaw':
@@ -652,10 +602,10 @@ def extract(
 
     def _stack_or_fallback(name: str, dim: int) -> np.ndarray:
         out = np.zeros((n_total, dim), dtype=np.float32)
-        for i, t in enumerate(traces):
+        for j, t in enumerate(traces):
             v = getattr(t, name)
             if v is not None:
-                out[i] = np.asarray(v, dtype=np.float32)
+                out[j] = np.asarray(v, dtype=np.float32)
         return out
 
     expression = _stack_or_fallback('expression', 50)
@@ -693,7 +643,6 @@ def extract(
                 translation = cleaned.astype(np.float32)
             rejected_per_frame |= rej
 
-        # Linear interpolation across detector dropouts.
         for arr_name, arr in (
             ('expression', expression),
             ('jaw', jaw),
@@ -718,16 +667,43 @@ def extract(
 
         # Bidirectional quaternion-flip fix on global_rot.
         quats = np.stack(
-            [axis_angle_to_quat(global_rot[i]) for i in range(n_total)], axis=0,
+            [axis_angle_to_quat(global_rot[j]) for j in range(n_total)], axis=0,
         )
         quats = fix_quat_sign_continuity(quats)
         global_rot = np.stack(
-            [quat_to_axis_angle(quats[i]) for i in range(n_total)], axis=0,
+            [quat_to_axis_angle(quats[j]) for j in range(n_total)], axis=0,
         ).astype(np.float32)
 
-    world_mat, global_rot, translation = _resolve_world_mat_and_recenter(
-        cfg, global_rot, translation, valid | interpolated,
+    # --- Recenter against the calibration world_mat ----------------
+    # Done BEFORE the LPF so the filter operates on small deltas
+    # (numerically better-conditioned than the absolute axis-angle
+    # which can wrap around π for large head turns).
+    global_rot, translation = _recenter_against_world_mat(
+        world_mat, cfg.flame_scale, global_rot, translation,
     )
+
+    # --- Symmetric FIR LPF on rotation/translation (and optional jaw)
+    # The same ``apply_offline_zero_phase`` is used in both online
+    # (lookahead from cfg.lpf_lookahead) and pseudo-online (larger
+    # lookahead from cfg.lpf_offline_lookahead). At extraction time
+    # we have the full clip in hand, so the streaming filter math is
+    # bit-equivalent to the offline edge-padded zero-phase filter.
+    if cfg.mode == 'pseudo-online':
+        L = int(cfg.lpf_offline_lookahead)
+    else:
+        L = int(cfg.lpf_lookahead)
+
+    if L > 0:
+        global_rot = apply_offline_zero_phase(
+            global_rot.astype(np.float64), L, cfg.lpf_cutoff_hz, cfg.fps,
+        ).astype(np.float32)
+        translation = apply_offline_zero_phase(
+            translation.astype(np.float64), L, cfg.lpf_cutoff_hz, cfg.fps,
+        ).astype(np.float32)
+        if cfg.lpf_jaw:
+            jaw = apply_offline_zero_phase(
+                jaw.astype(np.float64), L, cfg.lpf_jaw_cutoff_hz, cfg.fps,
+            ).astype(np.float32)
 
     detector.close()
 
@@ -743,7 +719,7 @@ def extract(
         rejected_mask=rejected_per_frame,
         mode=cfg.mode,
         intrinsics=np.array(cfg.intrinsics, dtype=np.float32),
-        world_mat=world_mat,
+        world_mat=world_mat.astype(np.float32),
         outer_bbox=outer_bbox.astype(np.int32),
         fps=cfg.fps,
         image_size=cfg.image_size,
