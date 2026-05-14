@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# Extract per-frame LHG (Listening Head Generation) FLAME features from a
-# video or a pre-extracted image directory. Mirrors the CLI shape of
-# demos/_preprocess_subject.sh but produces a different, smaller artifact
-# (lhg_features.npz) intended as either teacher data (--mode pseudo-online)
-# or as the recorded output of an inference-equivalent pipeline (--mode online).
+# Stage 2 of the LHG (Listening Head Generation) preprocessing pipeline.
+# Extracts per-frame FLAME features (expression / jaw / eyelid via SMIRK,
+# global_rot / translation via cv2.solvePnP EPnP) from a video or
+# pre-extracted image directory and writes lhg_features.npz.
 #
-# This script is NOT a substitute for demos/_preprocess_subject.sh — that
-# script produces tracked_params.json for HRAvatar AVATAR PERSONAL FIT via
-# DECA's full-clip joint optimization. See doc/preprocessing_scope.md for
-# why the two pipelines must stay separate.
+# This is NOT a substitute for demos/_preprocess_subject.sh — that script
+# (Stage 1, runs DECA optimize) produces tracked_params.json with the
+# clip-constant world_mat / shapecode / intrinsics that THIS script
+# consumes via --calibration. Run Stage 1 once per subject; then run
+# Stage 2 here per clip. See doc/preprocessing_scope.md for why the two
+# pipelines must stay separate.
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -18,7 +19,7 @@ usage() {
 Usage:
   bash demos/extract_lhg_features.sh \
       --video <path> \
-      --intrinsics <hdtf|insta|custom:fx,fy,cx,cy> \
+      --calibration <tracked_params.json> \
       --output <path> \
       --mode <online|pseudo-online> \
       [options]
@@ -26,45 +27,71 @@ Usage:
 Required arguments:
   --video PATH         input mp4/mov OR an outer-cropped image/ directory
                        (when a directory, outer_offset.json is auto-detected)
-  --intrinsics VALUE   "hdtf" | "insta" | "custom:fx,fy,cx,cy"
-                       (camera intrinsics in the OUTER-CROP coordinate
-                        system, i.e. the image_size square)
+  --calibration PATH   Stage 1 tracked_params.json (or _v2 sibling). Stage 2
+                       reads world_mat / shapecode / intrinsics from this
+                       file and uses them as clip-constants. Run Stage 1
+                       once per subject:
+                         bash demos/_preprocess_subject.sh \
+                              --sbj-root <root> --sbj-name <name> \
+                              --video <video> --intrinsics <preset> \
+                              --lhg-only
   --output PATH        output .npz path
   --mode MODE          online       : strictly causal, mirrors LHG inference
                        pseudo-online: causal core + future-info corrections
-                                      for one-time anomalies (teacher data)
+                                      (bidirectional Hampel, dropout
+                                      interpolation, quaternion-flip fix,
+                                      larger-lookahead FIR LPF). Use for
+                                      detector-dropout salvage or
+                                      future-info smoothing studies. The
+                                      LHG teacher data does NOT come from
+                                      this path under the 2026-05-14 grand
+                                      design — see demos/build_lhg_teacher.sh.
 
 Optional flags:
-  --fps N              source frame rate                   (default 30)
+  --intrinsics VALUE   override the EPnP intrinsics. Default: read from
+                       --calibration. Accepts "hdtf" / "insta" /
+                       "custom:fx,fy,cx,cy".
+  --fps N              feature-stream FPS                 (default 25)
+                       LHG inference runs at 10 FPS but the per-frame
+                       feature stream is at this rate.
   --image-size N       outer-crop output square size in px (default 512)
                        Must match the intrinsics preset.
   --bbox-scale F       SMIRK 224-crop scale factor around the stable bbox
                        center                             (default 1.6)
-  --world-mat PATH     reuse world_mat from an existing tracked_params.json
-                       instead of calibrating from this clip
-  --world-mat-calibration-frames N
-                       N first valid frames used to calibrate world_mat when
-                       --world-mat is not supplied         (default 60)
-  --flame-scale F      FLAME scale convention              (default 4.0
-                       — HRAvatar v1; pass 1.0 for v2)
+  --flame-scale F      override flame_scale (default: inferred from the
+                       calibration file, _v2 → 1.0 else 4.0)
   --correspondence PATH
-                       MediaPipe→FLAME landmark correspondence asset
-                       (default assets/lhg/mediapipe_flame_landmarks.npz;
-                        build via tools/build_mediapipe_flame_correspondence.py)
-  --run-deca-encoder   also invoke DECA coarse encoder for diagnostics
+                       detector-specific FLAME correspondence asset
+                       (default assets/lhg/mediapipe_flame_landmarks.npz
+                        for mediapipe; assets/lhg/dlib_flame_landmarks.npz
+                        for fan)
+  --run-deca-encoder   diagnostic: also invoke DECA coarse encoder
                        (NOT used for any LHG output channel)
-  --detector {fan|mediapipe}
-                       landmark detector                  (default fan)
-                       fan       : face_alignment 68-pt, matches avatar-fit
-                                   precision but ~3x slower than mediapipe
-                       mediapipe : MediaPipe FaceMesh 478-pt, fast but
-                                   weak EPnP precision
+  --detector {mediapipe|fan}
+                       landmark detector                  (default mediapipe)
+                       mediapipe : MediaPipe FaceLandmarker 478-pt + iris
+                       fan       : face_alignment 68-pt (matches HRAvatar
+                                   avatar fit pipeline; per-frame absolute
+                                   accuracy is comparable to mediapipe)
+  --mediapipe-mode {image|video}
+                       MediaPipe running mode             (default video)
+                       video : internal Kalman tracker, lower jitter
+                       image : per-frame baseline (used for jitter A/B)
+  --lookahead L        symmetric FIR LPF one-sided lookahead in frames
+                       (default 4 → taps=9, 160ms lag at 25 fps).
+                       Set 0 to disable the LPF entirely.
+  --lpf-cutoff-hz F    LPF cutoff (Hz) for rotation+translation (default 4)
+  --lpf-jaw            also apply the LPF to jaw          (default off)
+  --lpf-jaw-cutoff-hz F
+                       LPF cutoff (Hz) for jaw            (default 10)
+  --lookahead-offline L
+                       Stage 3 offline FIR one-sided lookahead
+                       (default 12 → taps=25). Ignored in --mode online.
   --camera-convention {hravatar|opencv}
                        coordinate frame for global_rot / translation /
                        world_mat                          (default hravatar)
-                       hravatar  : X right, Y up, -Z forward — directly
-                                   consumable by HRAvatar's renderer
-                       opencv    : X right, Y down, +Z forward (raw EPnP)
+                       hravatar : X right, Y up, -Z forward (renderer-ready)
+                       opencv   : X right, Y down, +Z forward (raw EPnP)
   --quiet              suppress progress bar
   -h, --help           print this message and exit
 
@@ -77,29 +104,35 @@ Output schema (lhg_features.npz, see lhg/output.py for the full list):
   eyelid           (N,  2) float32   SMIRK
   global_rot       (N,  3) float32   axis-angle from cv2.solvePnP (EPnP)
   translation      (N,  3) float32   FLAME canonical space (pre flame_scale)
-  valid_mask       (N,)    bool      False = MediaPipe missed the frame
+  valid_mask       (N,)    bool      False = detector missed the frame
   interpolated_mask(N,)    bool      pseudo-online interpolation applied
   rejected_mask    (N,)    bool      Hampel-rejected
-  world_mat        (4, 4)  float32   clip-constant camera extrinsics
-  intrinsics       (4,)    float32   [fx, fy, cx, cy]
+  world_mat        (4, 4)  float32   clip-constant camera extrinsics from
+                                     --calibration
+  intrinsics       (4,)    float32   [fx, fy, cx, cy] from --calibration
   outer_bbox       (4,)    int32     [xmin, xmax, ymin, ymax] in raw video coord
 
 EOF
 }
 
 VIDEO=""
-INTRINSICS=""
+CALIBRATION=""
 OUTPUT=""
 MODE=""
-FPS=30
+INTRINSICS=""
+FPS=25
 IMAGE_SIZE=512
 BBOX_SCALE=""
-WORLD_MAT=""
-WORLD_MAT_CAL_FRAMES=""
 FLAME_SCALE=""
 CORRESPONDENCE=""
 RUN_DECA_ENCODER=0
 DETECTOR=""
+MEDIAPIPE_MODE=""
+LOOKAHEAD=""
+LPF_CUTOFF_HZ=""
+LPF_JAW=0
+LPF_JAW_CUTOFF_HZ=""
+LOOKAHEAD_OFFLINE=""
 CAMERA_CONVENTION=""
 QUIET=0
 
@@ -114,18 +147,23 @@ require_value() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --video)        require_value "$@"; VIDEO="$2"; shift 2 ;;
-    --intrinsics)   require_value "$@"; INTRINSICS="$2"; shift 2 ;;
+    --calibration)  require_value "$@"; CALIBRATION="$2"; shift 2 ;;
     --output)       require_value "$@"; OUTPUT="$2"; shift 2 ;;
     --mode)         require_value "$@"; MODE="$2"; shift 2 ;;
+    --intrinsics)   require_value "$@"; INTRINSICS="$2"; shift 2 ;;
     --fps)          require_value "$@"; FPS="$2"; shift 2 ;;
     --image-size|--image_size) require_value "$@"; IMAGE_SIZE="$2"; shift 2 ;;
     --bbox-scale)   require_value "$@"; BBOX_SCALE="$2"; shift 2 ;;
-    --world-mat)    require_value "$@"; WORLD_MAT="$2"; shift 2 ;;
-    --world-mat-calibration-frames) require_value "$@"; WORLD_MAT_CAL_FRAMES="$2"; shift 2 ;;
     --flame-scale)  require_value "$@"; FLAME_SCALE="$2"; shift 2 ;;
     --correspondence) require_value "$@"; CORRESPONDENCE="$2"; shift 2 ;;
     --run-deca-encoder) RUN_DECA_ENCODER=1; shift ;;
     --detector)     require_value "$@"; DETECTOR="$2"; shift 2 ;;
+    --mediapipe-mode) require_value "$@"; MEDIAPIPE_MODE="$2"; shift 2 ;;
+    --lookahead)    require_value "$@"; LOOKAHEAD="$2"; shift 2 ;;
+    --lpf-cutoff-hz) require_value "$@"; LPF_CUTOFF_HZ="$2"; shift 2 ;;
+    --lpf-jaw)      LPF_JAW=1; shift ;;
+    --lpf-jaw-cutoff-hz) require_value "$@"; LPF_JAW_CUTOFF_HZ="$2"; shift 2 ;;
+    --lookahead-offline) require_value "$@"; LOOKAHEAD_OFFLINE="$2"; shift 2 ;;
     --camera-convention) require_value "$@"; CAMERA_CONVENTION="$2"; shift 2 ;;
     --quiet)        QUIET=1; shift ;;
     -h|--help)      usage; exit 0 ;;
@@ -134,7 +172,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${VIDEO}" || -z "${INTRINSICS}" || -z "${OUTPUT}" || -z "${MODE}" ]]; then
+if [[ -z "${VIDEO}" || -z "${CALIBRATION}" || -z "${OUTPUT}" || -z "${MODE}" ]]; then
   usage
   exit 2
 fi
@@ -151,19 +189,24 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 EXTRA_ARGS=()
+[[ -n "${INTRINSICS}" ]]            && EXTRA_ARGS+=(--intrinsics "${INTRINSICS}")
 [[ -n "${BBOX_SCALE}" ]]            && EXTRA_ARGS+=(--bbox-scale "${BBOX_SCALE}")
-[[ -n "${WORLD_MAT}" ]]             && EXTRA_ARGS+=(--world-mat "${WORLD_MAT}")
-[[ -n "${WORLD_MAT_CAL_FRAMES}" ]]  && EXTRA_ARGS+=(--world-mat-calibration-frames "${WORLD_MAT_CAL_FRAMES}")
 [[ -n "${FLAME_SCALE}" ]]           && EXTRA_ARGS+=(--flame-scale "${FLAME_SCALE}")
 [[ -n "${CORRESPONDENCE}" ]]        && EXTRA_ARGS+=(--correspondence "${CORRESPONDENCE}")
 [[ "${RUN_DECA_ENCODER}" == "1" ]]  && EXTRA_ARGS+=(--run-deca-encoder)
 [[ -n "${DETECTOR}" ]]              && EXTRA_ARGS+=(--detector "${DETECTOR}")
+[[ -n "${MEDIAPIPE_MODE}" ]]        && EXTRA_ARGS+=(--mediapipe-mode "${MEDIAPIPE_MODE}")
+[[ -n "${LOOKAHEAD}" ]]             && EXTRA_ARGS+=(--lookahead "${LOOKAHEAD}")
+[[ -n "${LPF_CUTOFF_HZ}" ]]         && EXTRA_ARGS+=(--lpf-cutoff-hz "${LPF_CUTOFF_HZ}")
+[[ "${LPF_JAW}" == "1" ]]           && EXTRA_ARGS+=(--lpf-jaw)
+[[ -n "${LPF_JAW_CUTOFF_HZ}" ]]     && EXTRA_ARGS+=(--lpf-jaw-cutoff-hz "${LPF_JAW_CUTOFF_HZ}")
+[[ -n "${LOOKAHEAD_OFFLINE}" ]]     && EXTRA_ARGS+=(--lookahead-offline "${LOOKAHEAD_OFFLINE}")
 [[ -n "${CAMERA_CONVENTION}" ]]     && EXTRA_ARGS+=(--camera-convention "${CAMERA_CONVENTION}")
 [[ "${QUIET}" == "1" ]]             && EXTRA_ARGS+=(--quiet)
 
 python -m lhg.extract \
     --video "${VIDEO}" \
-    --intrinsics "${INTRINSICS}" \
+    --calibration "${CALIBRATION}" \
     --output "${OUTPUT}" \
     --mode "${MODE}" \
     --fps "${FPS}" \
