@@ -38,10 +38,12 @@ class LHGFeatures:
     eyelid: np.ndarray                  # (N, 2) float32
     global_rot: np.ndarray              # (N, 3) float32 axis-angle
     translation: np.ndarray             # (N, 3) float32 FLAME canonical units
+    neck_pose: np.ndarray               # (N, 3) float32 axis-angle (neck joint)
+    eye_pose: np.ndarray                # (N, 6) float32 [eye_l(3), eye_r(3)] axis-angle
     valid_mask: np.ndarray              # (N,) bool — False = MediaPipe miss
     interpolated_mask: np.ndarray       # (N,) bool — True = filled in pseudo-online
     rejected_mask: np.ndarray           # (N,) bool — True = Hampel-rejected
-    mode: str                           # 'online' / 'pseudo-online'
+    mode: str                           # 'online' / 'pseudo-online' / 'offline_teacher'
     intrinsics: np.ndarray              # (4,) [fx, fy, cx, cy]
     world_mat: np.ndarray               # (4, 4) float32, in camera_convention frame
     outer_bbox: np.ndarray              # (4,) int32 [xmin, xmax, ymin, ymax] in raw video coord
@@ -62,6 +64,8 @@ class LHGFeatures:
             eyelid=self.eyelid.astype(np.float32),
             global_rot=self.global_rot.astype(np.float32),
             translation=self.translation.astype(np.float32),
+            neck_pose=self.neck_pose.astype(np.float32),
+            eye_pose=self.eye_pose.astype(np.float32),
             valid_mask=self.valid_mask.astype(bool),
             interpolated_mask=self.interpolated_mask.astype(bool),
             rejected_mask=self.rejected_mask.astype(bool),
@@ -78,6 +82,20 @@ class LHGFeatures:
     @classmethod
     def read(cls, path: str | Path) -> 'LHGFeatures':
         with np.load(path, allow_pickle=False) as npz:
+            n = npz['expression'].shape[0]
+            # Back-compat: pre-2026-05-14 npz files lack neck_pose / eye_pose.
+            # Fill with zeros so the rest of the pipeline (render_adapter etc.)
+            # sees a complete LHGFeatures regardless. Newly-extracted npz from
+            # the offline_teacher / new online backends will always have these
+            # fields populated.
+            neck_pose = (
+                npz['neck_pose'] if 'neck_pose' in npz.files
+                else np.zeros((n, 3), dtype=np.float32)
+            )
+            eye_pose = (
+                npz['eye_pose'] if 'eye_pose' in npz.files
+                else np.zeros((n, 6), dtype=np.float32)
+            )
             return cls(
                 frame_basenames=npz['frame_basenames'],
                 expression=npz['expression'],
@@ -85,6 +103,8 @@ class LHGFeatures:
                 eyelid=npz['eyelid'],
                 global_rot=npz['global_rot'],
                 translation=npz['translation'],
+                neck_pose=neck_pose,
+                eye_pose=eye_pose,
                 valid_mask=npz['valid_mask'],
                 interpolated_mask=npz['interpolated_mask'],
                 rejected_mask=npz['rejected_mask'],

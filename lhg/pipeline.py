@@ -707,6 +707,15 @@ def extract(
 
     detector.close()
 
+    # Stage 2 online backends (epnp / deca_encoder) do not currently
+    # estimate neck or eye pose — those are clip-baseline or supplied
+    # by a different module. Emit zeros for now so the LHGFeatures
+    # schema stays complete; the offline teacher (lhg.teacher) writes
+    # real DECA-optimize values into these slots, and downstream LHG
+    # tooling can decide whether to learn them or not.
+    neck_pose = np.zeros((n_total, 3), dtype=np.float32)
+    eye_pose = np.zeros((n_total, 6), dtype=np.float32)
+
     return LHGFeatures(
         frame_basenames=np.array(frames.basenames(), dtype=str),
         expression=expression,
@@ -714,6 +723,8 @@ def extract(
         eyelid=eyelid,
         global_rot=global_rot,
         translation=translation,
+        neck_pose=neck_pose,
+        eye_pose=eye_pose,
         valid_mask=valid,
         interpolated_mask=interpolated,
         rejected_mask=rejected_per_frame,
