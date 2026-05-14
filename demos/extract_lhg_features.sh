@@ -92,6 +92,13 @@ Optional flags:
                        world_mat                          (default hravatar)
                        hravatar : X right, Y up, -Z forward (renderer-ready)
                        opencv   : X right, Y down, +Z forward (raw EPnP)
+  --backend {epnp|deca_encoder}
+                       per-frame translation / global_rot estimator (default
+                       epnp). epnp = cv2.solvePnP(EPnP) on shape-aware
+                       FLAME landmarks (5/7 system). deca_encoder = reuse
+                       offline DECA coarse encoder (2026-05-14 grand
+                       design); global_rot = DECA pose[0:3], translation
+                       = 0 (Phase B Stage 1).
   --quiet              suppress progress bar
   -h, --help           print this message and exit
 
@@ -134,6 +141,7 @@ LPF_JAW=0
 LPF_JAW_CUTOFF_HZ=""
 LOOKAHEAD_OFFLINE=""
 CAMERA_CONVENTION=""
+BACKEND=""
 QUIET=0
 
 require_value() {
@@ -165,6 +173,7 @@ while [[ $# -gt 0 ]]; do
     --lpf-jaw-cutoff-hz) require_value "$@"; LPF_JAW_CUTOFF_HZ="$2"; shift 2 ;;
     --lookahead-offline) require_value "$@"; LOOKAHEAD_OFFLINE="$2"; shift 2 ;;
     --camera-convention) require_value "$@"; CAMERA_CONVENTION="$2"; shift 2 ;;
+    --backend)      require_value "$@"; BACKEND="$2"; shift 2 ;;
     --quiet)        QUIET=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
@@ -202,6 +211,7 @@ EXTRA_ARGS=()
 [[ -n "${LPF_JAW_CUTOFF_HZ}" ]]     && EXTRA_ARGS+=(--lpf-jaw-cutoff-hz "${LPF_JAW_CUTOFF_HZ}")
 [[ -n "${LOOKAHEAD_OFFLINE}" ]]     && EXTRA_ARGS+=(--lookahead-offline "${LOOKAHEAD_OFFLINE}")
 [[ -n "${CAMERA_CONVENTION}" ]]     && EXTRA_ARGS+=(--camera-convention "${CAMERA_CONVENTION}")
+[[ -n "${BACKEND}" ]]               && EXTRA_ARGS+=(--backend "${BACKEND}")
 [[ "${QUIET}" == "1" ]]             && EXTRA_ARGS+=(--quiet)
 
 python -m lhg.extract \

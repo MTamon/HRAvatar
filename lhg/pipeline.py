@@ -256,6 +256,7 @@ def per_frame_core(
     last_valid: FrameTrace | None,
     frame_index: int,
     epnp_object_points: np.ndarray | None = None,
+    deca_encoder=None,
 ) -> FrameTrace:
     """One causal frame step. Shared by online and pseudo-online modes.
 
@@ -300,26 +301,64 @@ def per_frame_core(
     )
     smirk_out = smirk.encode(face_224)
 
-    img_pts_2d = landmarks[correspondence.mp_indices]
-    object_points = (
-        epnp_object_points
-        if epnp_object_points is not None
-        else correspondence.flame_canonical_xyz
-    )
-    if object_points is None:
-        raise RuntimeError(
-            'No 3D landmark positions available for EPnP. Either pass '
-            '``epnp_object_points`` (preferred — built from Stage 1 '
-            'shapecode via build_shape_aware_landmarks) or ensure the '
-            'correspondence asset carries ``flame_canonical_xyz`` (neutral '
-            'mesh fallback).')
-    rvec, tvec_canonical, ok = solve_epnp(
-        img_pts_2d,
-        object_points,
-        K,
-        cfg.flame_scale,
-        camera_convention=cfg.camera_convention,
-    )
+    if getattr(cfg, 'online_backend', 'epnp') == 'deca_encoder':
+        # 2026-05-14 grand design: re-use the offline pipeline's DECA
+        # coarse encoder for the per-frame pose. ``pose[0:3]`` is the
+        # FLAME global rotation (axis-angle) in the same convention DECA
+        # optimize.py wrote into ``fullposecode[0:3]`` — directly
+        # comparable to the offline teacher channel.
+        #
+        # Translation is the clip-constant world_mat translation
+        # (in FLAME-canonical scale) so that ``_recenter_against_world_mat``
+        # subtracts it cleanly to produce a zero delta — i.e. the
+        # avatar stays parked at the world_mat reference position
+        # while we have not yet built the cam→z proxy that turns the
+        # DECA encoder's per-frame ``cam`` into a real depth signal
+        # (Phase B-2 / Phase B Stage 2). Stage 1 here is the "rotation
+        # only" baseline against which the Phase B Stage 2 lift will
+        # be measured.
+        if deca_encoder is None:
+            raise RuntimeError(
+                'cfg.online_backend == "deca_encoder" but no deca_encoder '
+                'was passed to per_frame_core. extract() must instantiate '
+                'lhg.encoders.DECAEncoder when this backend is selected.')
+        deca_out = deca_encoder.encode(face_224)
+        rvec = np.asarray(deca_out['pose'][0:3], dtype=np.float64)
+        # World mat is available on cfg via the calibration that
+        # extract() resolved; but per_frame_core does not currently
+        # see it. We emit the "absolute pose centered at world_mat"
+        # convention that ``_recenter_against_world_mat`` already
+        # expects: just put the t_ref_canonical here so the
+        # subsequent recenter produces zero delta. The wm_t reference
+        # is read from bbox_state (which extract() stashed for us)
+        # to avoid expanding per_frame_core's signature.
+        wm_t_canonical = getattr(bbox_state, 'wm_t_canonical', None)
+        if wm_t_canonical is None:
+            tvec_canonical = np.zeros(3, dtype=np.float64)
+        else:
+            tvec_canonical = np.asarray(wm_t_canonical, dtype=np.float64)
+        ok = True
+    else:
+        img_pts_2d = landmarks[correspondence.mp_indices]
+        object_points = (
+            epnp_object_points
+            if epnp_object_points is not None
+            else correspondence.flame_canonical_xyz
+        )
+        if object_points is None:
+            raise RuntimeError(
+                'No 3D landmark positions available for EPnP. Either pass '
+                '``epnp_object_points`` (preferred — built from Stage 1 '
+                'shapecode via build_shape_aware_landmarks) or ensure the '
+                'correspondence asset carries ``flame_canonical_xyz`` (neutral '
+                'mesh fallback).')
+        rvec, tvec_canonical, ok = solve_epnp(
+            img_pts_2d,
+            object_points,
+            K,
+            cfg.flame_scale,
+            camera_convention=cfg.camera_convention,
+        )
     if not ok:
         if last_valid is None:
             return FrameTrace(
@@ -499,14 +538,27 @@ def extract(
     correspondence = load_correspondence(correspondence_path)
     K = intrinsics_matrix(*cfg.intrinsics)
 
-    # Build shape-aware EPnP object points from the Stage 1 shapecode.
-    # The neutral correspondence asset would bias EPnP's depth estimate by
-    # the ratio of (neutral face width) / (subject face width); see
-    # build_shape_aware_landmarks for the derivation.
-    from .correspondence import build_shape_aware_landmarks
-    epnp_object_points = build_shape_aware_landmarks(
-        correspondence, calibration.shapecode,
-    )
+    online_backend = getattr(cfg, 'online_backend', 'epnp')
+
+    epnp_object_points = None
+    deca_encoder = None
+    if online_backend == 'deca_encoder':
+        # 2026-05-14 grand design: per-frame pose comes from the offline
+        # pipeline's DECA coarse encoder. We instantiate it lazily here
+        # (heavy CUDA-rasterizer import) and reuse the SAME wrapper used
+        # by the ``--run-deca-encoder`` diagnostic path.
+        from .encoders import DECAEncoder
+        deca_encoder = DECAEncoder()
+    else:
+        # EPnP backend: build the shape-aware EPnP object points from
+        # the Stage 1 shapecode. The neutral correspondence asset would
+        # bias EPnP's depth estimate by the ratio of (neutral face
+        # width) / (subject face width); see build_shape_aware_landmarks
+        # for the derivation.
+        from .correspondence import build_shape_aware_landmarks
+        epnp_object_points = build_shape_aware_landmarks(
+            correspondence, calibration.shapecode,
+        )
 
     raw_frames_rgb: list[np.ndarray] = list(frames.iter_frames())
     n_total = len(raw_frames_rgb)
@@ -534,6 +586,15 @@ def extract(
         anchor=np.zeros(2, dtype=np.float64),
         target=np.zeros(2, dtype=np.float64),
         ring=np.zeros(max(int(cfg.bbox_window), 1), dtype=bool),
+    )
+    # Stash the clip-constant world_mat translation (in FLAME-canonical
+    # scale) on bbox_state so the deca_encoder backend can pull it out
+    # without expanding per_frame_core's already-large signature. This
+    # is used so that ``_recenter_against_world_mat`` produces a zero
+    # translation delta when the backend has no real per-frame depth
+    # estimate of its own (Phase B Stage 1).
+    bbox_state.wm_t_canonical = (
+        world_mat[:3, 3].astype(np.float64) / float(cfg.flame_scale)
     )
     min_sigma_per_channel = {
         'expression': cfg.hampel_min_sigma_expression,
@@ -565,6 +626,7 @@ def extract(
             outer_img, detector, smirk, correspondence, K, cfg,
             bbox_state, last_valid, frame_index=i,
             epnp_object_points=epnp_object_points,
+            deca_encoder=deca_encoder,
         )
 
         if trace.valid and trace.global_rot is not None:

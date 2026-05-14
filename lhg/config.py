@@ -1,43 +1,75 @@
 """Runtime configuration for the LHG feature extraction pipeline."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
 
 Mode = Literal['online', 'pseudo-online']
+OnlineBackend = Literal['epnp', 'deca_encoder']
 
 
 @dataclass
 class LHGConfig:
     """All runtime knobs for ``lhg.pipeline.extract``.
 
-    The defaults mirror the same values used by
-    ``preprocess/stable_bbox.py`` (deadzone, K-of-N, tau) so the LHG
-    feature stream stays parameter-aligned with the rest of the
-    preprocessing stack.
+    Stage layout
+    ------------
+    Stage 1 (offline calibration, ``demos/_preprocess_subject.sh
+    --lhg-only``) writes ``tracked_params.json`` whose ``world_mat``,
+    ``shapecode``, and ``intrinsics`` are read here via
+    ``calibration_path`` and used as clip-constants.
+
+    Stage 2 (this config governs) is the per-frame online pipeline:
+    detector → stable bbox → SMIRK → EPnP → causal Hampel → symmetric
+    FIR LPF on rotation/translation (and optionally jaw).
+
+    Stage 3 (``--mode pseudo-online``, future) re-runs Stage 2 then
+    applies bidirectional Hampel + linear interpolation +
+    ``apply_offline_zero_phase`` with a larger lookahead.
+
+    The defaults mirror ``preprocess/stable_bbox.py`` (deadzone,
+    K-of-N, tau) so the LHG feature stream stays parameter-aligned
+    with the rest of the preprocessing stack.
     """
 
     mode: Mode
     fps: float
 
+    # Path to the Stage 1 ``tracked_params.json`` (or ``_v2`` sibling).
+    # Required: Stage 2 reads world_mat / shapecode / intrinsics from
+    # this file. The previous "calibration window inside extract()"
+    # path has been removed because per-frame EPnP cannot reproduce
+    # DECA optimize.py's clip-wide joint accuracy.
+    calibration_path: str | None = None
+
     # Landmark detector for both the stable bbox and the EPnP solve.
-    # 'fan' is the avatar-fit-compatible default — its 68 dlib-ordered
-    # landmarks include the well-distributed brow + nose + eye + face
-    # contour points needed for accurate per-frame pose recovery, and
-    # the static FLAME barycentric mapping (assets/flame_model/
-    # landmark_embedding.npy) is reusable verbatim.
-    # 'mediapipe' is faster but lacks anatomically correct lateral
-    # coverage in MICA's 105 correspondences, so per-frame depth has
-    # ~10x more noise than FAN-based EPnP — workable only with
-    # significant L3 (LHG model) temporal regularization.
-    detector_type: str = 'fan'
+    # Default 'mediapipe' uses MediaPipe FaceLandmarker (478pt + iris)
+    # in VIDEO running mode. Stable subset is precomputed in
+    # ``preprocess._smirk_constants.STABLE_LANDMARK_INDICES`` and the
+    # MICA-derived FLAME barycentric is shipped in
+    # ``assets/lhg/mediapipe_flame_landmarks.npz``.
+    #
+    # 'fan' (face_alignment 68pt) is retained for the Phase 4 A/B test
+    # and for users who want a detector identical to HRAvatar's avatar
+    # fit pipeline. FAN's per-frame absolute accuracy is comparable to
+    # MediaPipe (both are EPnP-precision-limited); the historical
+    # "FAN gives 5-10x lower jitter" statement only held for a
+    # seed-once-bbox setup that fails when the subject moves.
+    detector_type: str = 'mediapipe'
+
+    # MediaPipe running mode. 'video' enables the internal Kalman
+    # tracker (lower per-frame jitter, slightly faster) and is the
+    # production default. 'image' is the per-frame baseline used in
+    # the Stage 2 jitter A/B comparison.
+    mediapipe_running_mode: str = 'video'
 
     # Camera intrinsics in the OUTER-CROP coordinate system (the same
-    # space the EPnP solve runs in). Use one of the named presets via
-    # ``intrinsics_preset`` or pass (fx, fy, cx, cy) directly.
+    # space the EPnP solve runs in). When ``calibration_path`` is set,
+    # these are OVERWRITTEN by the calibration's intrinsics so the
+    # per-frame EPnP and the avatar-fit ``world_mat`` agree.
     intrinsics: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     image_size: int = 512
 
@@ -57,22 +89,6 @@ class LHGConfig:
     # natural head/face motion (which can briefly produce per-frame
     # deltas much larger than the local MAD estimate around a quiet
     # baseline) does NOT get misclassified as an outlier.
-    #
-    # The per-channel defaults below are sized so that the rejection
-    # threshold (3 * min_sigma) covers natural motion comfortably:
-    #
-    # * expression (50d): SMIRK output range ~[-3, +3]; per-frame delta
-    #   on speech onset can hit 0.5/dim. Floor 0.30 → threshold 0.90.
-    # * jaw (3d): per-frame 0.05-0.10 rad during fast speech. Floor
-    #   0.10 → threshold 0.30 rad (~17°).
-    # * eyelid (2d): blink takes ~3 frames to close from 0→1, i.e.
-    #   ~0.33/frame. Floor 0.30 → threshold 0.90 covers full blink.
-    # * global_rot (3d, axis-angle): natural fast head turn ~6°/frame
-    #   = 0.10 rad. Floor 0.30 → threshold 0.90 rad (~52°), tolerates
-    #   a head whip without misattributing it to a tracking glitch.
-    # * translation (3d, FLAME canonical units): max real shift
-    #   ~3-5 cm/frame = 0.02-0.04 unit. Floor 0.05 → threshold 0.15
-    #   (huge per-frame jump = clear anomaly).
     causal_hampel_window: int = 5
     causal_hampel_k_sigma: float = 3.0
     bidirectional_hampel_window: int = 11
@@ -83,24 +99,57 @@ class LHGConfig:
     hampel_min_sigma_global_rot: float = 0.30
     hampel_min_sigma_translation: float = 0.05
 
+    # Symmetric (zero-phase) FIR LPF on rotation/translation. Applied
+    # in both online (StreamingSymmetricFIR with lookahead L=4 default
+    # → 160ms@25fps lag) and pseudo-online (apply_offline_zero_phase
+    # with L=lpf_offline_lookahead). Filter design is identical
+    # between the two modes; only the tap count differs.
+    #
+    # ``lpf_lookahead`` is the ONLINE filter's one-sided lookahead.
+    # Set to 0 to disable LPF entirely (pass-through).
+    lpf_lookahead: int = 4
+    lpf_cutoff_hz: float = 4.0
+
+    # Optional LPF on jaw with a separate cutoff. Default OFF — jaw
+    # carries syllable-rate (~5-8 Hz) information that LHG models use
+    # for lip-sync, so the cutoff is set high (10 Hz) when opted in
+    # to attenuate detector-noise above the speech band without
+    # eating into syllabic content.
+    lpf_jaw: bool = False
+    lpf_jaw_cutoff_hz: float = 10.0
+
+    # Pseudo-online (Stage 3) only: lookahead for the offline filter.
+    # 12 → taps=25, matches the user's existing offline FIR
+    # configuration (cutoff 4 Hz @ 25 fps).
+    lpf_offline_lookahead: int = 12
+
     # FLAME convention. v1 uses ``flame_scale=4.0`` (HRAvatar default);
     # v2 uses 1.0. The output ``translation`` channel is always stored
     # in FLAME-canonical space (i.e. before multiplication by
     # ``flame_scale``), regardless of which convention was used to
-    # solve the PnP.
+    # solve the PnP. Auto-overridden by Stage 1 calibration when
+    # provided.
     flame_scale: float = 4.0
-
-    # When ``world_mat_path`` is None and ``world_mat_calibration_frames``
-    # > 0, the first N frames are used to compute the clip-constant
-    # ``world_mat`` from the per-frame translation mean.
-    world_mat_path: str | None = None
-    world_mat_calibration_frames: int = 60
 
     # Diagnostic switches. The DECA encoder is NOT used for any output
     # channel; it is invoked only when ``run_deca_encoder=True`` so its
     # per-frame ``cam`` / ``pose`` can be persisted alongside the SMIRK
     # output for offline debugging.
     run_deca_encoder: bool = False
+
+    # Online backend selects which per-frame translation/global_rot
+    # estimator the pipeline runs:
+    #
+    # * 'epnp' (legacy, default for backwards compatibility) — solve
+    #   cv2.solvePnP(EPnP) per frame against the shape-aware FLAME
+    #   landmark template. Independent of any DECA/offline coupling.
+    #
+    # * 'deca_encoder' (2026-05-14 grand design) — re-use the offline
+    #   pipeline's DECA encoder. ``global_rot`` comes from
+    #   ``pose[0:3]``; translation is currently 0 (Stage 1 of the new
+    #   backend) and will be lifted to a cam→z proxy once the
+    #   subject's clip-mean cam scale is available (Phase B-2).
+    online_backend: OnlineBackend = 'epnp'
 
     # Camera coordinate convention for the global_rot / translation /
     # world_mat outputs. Default 'hravatar' produces values directly

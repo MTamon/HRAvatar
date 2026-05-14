@@ -82,6 +82,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--run-deca-encoder', action='store_true',
                    help='Diagnostic only: also invoke DECA coarse encoder.')
     p.add_argument(
+        '--backend', choices=('epnp', 'deca_encoder'), default='epnp',
+        help='Online backend for per-frame translation / global_rot. '
+             '"epnp" (default, 5/7 system) runs cv2.solvePnP(EPnP) against a '
+             'shape-aware FLAME landmark template. "deca_encoder" '
+             '(2026-05-14 grand design) reuses the offline pipeline\'s '
+             'DECA coarse encoder: global_rot = pose[0:3], translation = 0 '
+             '(Phase B Stage 1; cam-to-z proxy lands in Phase B Stage 2). '
+             'expression / jaw / eyelid come from SMIRK in both cases.',
+    )
+    p.add_argument(
         '--detector', choices=('mediapipe', 'fan'), default='mediapipe',
         help='Landmark detector. mediapipe (default) = MediaPipe '
              'FaceLandmarker 478-pt + iris; fan = face_alignment 68-pt '
@@ -173,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         lpf_jaw=args.lpf_jaw,
         lpf_jaw_cutoff_hz=args.lpf_jaw_cutoff_hz,
         lpf_offline_lookahead=args.lookahead_offline,
+        online_backend=args.backend,
     )
 
     frames = FrameSource(args.video)
