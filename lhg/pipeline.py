@@ -257,6 +257,7 @@ def per_frame_core(
     frame_index: int,
     epnp_object_points: np.ndarray | None = None,
     deca_encoder=None,
+    landmark_computer=None,
 ) -> FrameTrace:
     """One causal frame step. Shared by online and pseudo-online modes.
 
@@ -357,11 +358,19 @@ def per_frame_core(
         ok = True
     else:
         img_pts_2d = landmarks[correspondence.mp_indices]
-        object_points = (
-            epnp_object_points
-            if epnp_object_points is not None
-            else correspondence.flame_canonical_xyz
-        )
+        if landmark_computer is not None:
+            # Expression-aware EPnP (cfg.epnp_expression_aware): rebuild
+            # the 3D landmark template from this frame's SMIRK
+            # expression so the EPnP solve fits an expressive face to
+            # an expressive template rather than the shape-only one.
+            object_points = landmark_computer.apply_expression(
+                smirk_out['expression'])
+        else:
+            object_points = (
+                epnp_object_points
+                if epnp_object_points is not None
+                else correspondence.flame_canonical_xyz
+            )
         if object_points is None:
             raise RuntimeError(
                 'No 3D landmark positions available for EPnP. Either pass '
@@ -567,16 +576,26 @@ def extract(
         # by the ``--run-deca-encoder`` diagnostic path.
         from .encoders import DECAEncoder
         deca_encoder = DECAEncoder()
-    else:
-        # EPnP backend: build the shape-aware EPnP object points from
-        # the Stage 1 shapecode. The neutral correspondence asset would
-        # bias EPnP's depth estimate by the ratio of (neutral face
-        # width) / (subject face width); see build_shape_aware_landmarks
-        # for the derivation.
-        from .correspondence import build_shape_aware_landmarks
-        epnp_object_points = build_shape_aware_landmarks(
-            correspondence, calibration.shapecode,
-        )
+    landmark_computer = None
+    if online_backend != 'deca_encoder':
+        if getattr(cfg, 'epnp_expression_aware', False):
+            # Expression-aware EPnP: build a per-frame landmark template
+            # from SMIRK's expression. SMIRK emits a 50-d expression
+            # vector, so the computer is set up for n_expression=50.
+            from .correspondence import ExpressionAwareLandmarkComputer
+            landmark_computer = ExpressionAwareLandmarkComputer(
+                correspondence, calibration.shapecode, n_expression=50,
+            )
+        else:
+            # EPnP backend: build the shape-aware EPnP object points
+            # from the Stage 1 shapecode. The neutral correspondence
+            # asset would bias EPnP's depth estimate by the ratio of
+            # (neutral face width) / (subject face width); see
+            # build_shape_aware_landmarks for the derivation.
+            from .correspondence import build_shape_aware_landmarks
+            epnp_object_points = build_shape_aware_landmarks(
+                correspondence, calibration.shapecode,
+            )
 
     raw_frames_rgb: list[np.ndarray] = list(frames.iter_frames())
     n_total = len(raw_frames_rgb)
@@ -651,6 +670,7 @@ def extract(
             bbox_state, last_valid, frame_index=i,
             epnp_object_points=epnp_object_points,
             deca_encoder=deca_encoder,
+            landmark_computer=landmark_computer,
         )
 
         if trace.valid and trace.global_rot is not None:
@@ -792,6 +812,33 @@ def extract(
             ).astype(np.float32)
 
     detector.close()
+
+    # --- Clip-constant translation offset correction ----------------
+    # (cfg.correct_translation_offset) EPnP's per-frame translation
+    # has a SYSTEMATIC offset relative to the DECA optimize joint
+    # output: EPnP fits a 16-pt MICA-anchor landmark set whose
+    # centroid differs from the 68-pt FAN landmark set DECA optimize
+    # is fit against. The offset is a clip constant (avatar-specific),
+    # so we measure it as the difference of clip means and subtract it
+    # — bringing the online translation onto the teacher's mean while
+    # leaving the per-frame jitter untouched.
+    translation_offset = None
+    if getattr(cfg, 'correct_translation_offset', False) and cfg.calibration_path:
+        import json as _json
+        with open(cfg.calibration_path) as _fp:
+            _tp = _json.load(_fp)
+        _deca_trans = []
+        for _k in sorted(k for k in _tp if isinstance(k, str)
+                         and k.endswith(('.png', '.jpg', '.bmp', '.jpeg'))):
+            _entry = _tp[_k]
+            if isinstance(_entry, dict) and 'translation' in _entry:
+                _deca_trans.append(
+                    np.asarray(_entry['translation'], dtype=np.float64).reshape(-1)[:3])
+        if _deca_trans:
+            _deca_mean = np.stack(_deca_trans, axis=0).mean(axis=0)
+            _epnp_mean = translation.astype(np.float64).mean(axis=0)
+            translation_offset = (_deca_mean - _epnp_mean).astype(np.float32)
+            translation = (translation + translation_offset).astype(np.float32)
 
     # Stage 2 online backends (epnp / deca_encoder) do not currently
     # estimate neck or eye pose — those are clip-baseline or supplied

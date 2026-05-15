@@ -92,6 +92,23 @@ def build_parser() -> argparse.ArgumentParser:
              'expression / jaw / eyelid come from SMIRK in both cases.',
     )
     p.add_argument(
+        '--expression-aware-landmark', action='store_true',
+        help='EPnP backend only: rebuild the EPnP 3D landmark template '
+             'per frame from SMIRK\'s expression output instead of using '
+             'the shape-only template. Targets per-frame jitter from '
+             'fitting an expression-neutral template to an expressive '
+             'face. (candidate "C" of the EPnP-bias study)',
+    )
+    p.add_argument(
+        '--correct-translation-offset', action='store_true',
+        help='EPnP backend only: subtract the clip-mean difference '
+             'between the EPnP translation and the calibration\'s DECA '
+             'optimize translation. Targets the systematic translation '
+             'bias from EPnP\'s 16-pt landmark centroid differing from '
+             'DECA optimize\'s 68-pt centroid. The offset is a clip '
+             'constant. (candidate "A" of the EPnP-bias study)',
+    )
+    p.add_argument(
         '--avatar-checkpoint', default=None,
         help='Path to the avatar checkpoint directory containing '
              '``flame_params_net.pth`` (typically '
@@ -198,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
         lpf_offline_lookahead=args.lookahead_offline,
         online_backend=args.backend,
         avatar_checkpoint=args.avatar_checkpoint,
+        epnp_expression_aware=args.expression_aware_landmark,
+        correct_translation_offset=args.correct_translation_offset,
     )
 
     frames = FrameSource(args.video)

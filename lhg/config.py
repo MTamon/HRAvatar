@@ -151,6 +151,25 @@ class LHGConfig:
     # (causality, no clip-wide joint optimization).
     avatar_checkpoint: str | None = None
 
+    # EPnP backend refinements (no effect when online_backend is not
+    # 'epnp'). Both are clip-constant or per-frame corrections layered
+    # on top of the base EPnP solve:
+    #
+    # * epnp_expression_aware: rebuild the EPnP 3D landmark template
+    #   per frame from SMIRK's expression output (instead of the
+    #   shape-only template). Targets the per-frame JITTER caused by
+    #   fitting an expression-neutral template to an expressive face.
+    #
+    # * correct_translation_offset: measure the clip-mean difference
+    #   between the EPnP translation and the calibration's DECA
+    #   optimize translation, then subtract it. Targets the SYSTEMATIC
+    #   translation bias from EPnP's 16-pt landmark centroid differing
+    #   from DECA optimize's 68-pt centroid. The offset is a clip
+    #   constant (avatar-specific), consistent with the grand design's
+    #   "maximize clip-constants" tenet.
+    epnp_expression_aware: bool = False
+    correct_translation_offset: bool = False
+
     # Online backend selects which per-frame translation/global_rot
     # estimator the pipeline runs:
     #

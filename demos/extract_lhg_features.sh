@@ -111,6 +111,16 @@ Optional flags:
                        only remaining differences come from online-only
                        constraints (causality, no clip-wide joint
                        optimization).
+  --expression-aware-landmark
+                       EPnP backend only. Rebuild the EPnP 3D landmark
+                       template per frame from SMIRK's expression
+                       (instead of the shape-only template). Targets
+                       per-frame jitter. (EPnP-bias study candidate C)
+  --correct-translation-offset
+                       EPnP backend only. Subtract the clip-mean
+                       EPnP-vs-DECA-optimize translation difference (a
+                       clip constant). Targets the systematic
+                       translation bias. (EPnP-bias study candidate A)
   --quiet              suppress progress bar
   -h, --help           print this message and exit
 
@@ -155,6 +165,8 @@ LOOKAHEAD_OFFLINE=""
 CAMERA_CONVENTION=""
 BACKEND=""
 AVATAR_CHECKPOINT=""
+EXPRESSION_AWARE_LANDMARK=0
+CORRECT_TRANSLATION_OFFSET=0
 QUIET=0
 
 require_value() {
@@ -188,6 +200,8 @@ while [[ $# -gt 0 ]]; do
     --camera-convention) require_value "$@"; CAMERA_CONVENTION="$2"; shift 2 ;;
     --backend)      require_value "$@"; BACKEND="$2"; shift 2 ;;
     --avatar-checkpoint|--avatar_checkpoint) require_value "$@"; AVATAR_CHECKPOINT="$2"; shift 2 ;;
+    --expression-aware-landmark|--expression_aware_landmark) EXPRESSION_AWARE_LANDMARK=1; shift ;;
+    --correct-translation-offset|--correct_translation_offset) CORRECT_TRANSLATION_OFFSET=1; shift ;;
     --quiet)        QUIET=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     --*) echo "unknown flag: $1" >&2; usage; exit 2 ;;
@@ -227,6 +241,8 @@ EXTRA_ARGS=()
 [[ -n "${CAMERA_CONVENTION}" ]]     && EXTRA_ARGS+=(--camera-convention "${CAMERA_CONVENTION}")
 [[ -n "${BACKEND}" ]]               && EXTRA_ARGS+=(--backend "${BACKEND}")
 [[ -n "${AVATAR_CHECKPOINT}" ]]     && EXTRA_ARGS+=(--avatar-checkpoint "${AVATAR_CHECKPOINT}")
+[[ "${EXPRESSION_AWARE_LANDMARK}" == "1" ]] && EXTRA_ARGS+=(--expression-aware-landmark)
+[[ "${CORRECT_TRANSLATION_OFFSET}" == "1" ]] && EXTRA_ARGS+=(--correct-translation-offset)
 [[ "${QUIET}" == "1" ]]             && EXTRA_ARGS+=(--quiet)
 
 python -m lhg.extract \
