@@ -5,12 +5,16 @@
 このディレクトリには、関連する MTamon ブランチ
 (`MTamon/DECA@release/cuda128`, `MTamon/smirk@release/cuda128`) のデモ構成に
 合わせた 3 つのデモがあります。
+**LHG (Listening Head Generation)** 用の独立した preprocessing パイプラインは
+[`lhg/`](../lhg/README.md) にあり、Stage 1/2/3 のワークフローはそちらの
+README にまとまっています。
 
 | # | スクリプト | 目的 |
 |---|---|---|
 | 1 | `demo_1_train_subject.sh` | 1 人の被写体動画から HRAvatar をエンドツーエンドで学習します。 |
 | 2 | `demo_2_cross_reenactment.sh` | 学習済み HRAvatar を、**別人**の動画から抽出した FLAME で駆動します。 |
 | 3 | `demo_3_overlay_tracking.py` | HRAvatar のレンダラが実際に受け取る **optimize 後** の特徴量 (FLAME 頂点 + ランドマーク + パラメータカード) を、元フレームに重ねて可視化します。 |
+| 4 | `extract_lhg_features.sh` + `render_lhg_features.sh` | LHG 用の per-frame 特徴量抽出 (Stage 2) と視覚検証レンダリング。詳細は [`lhg/README.md`](../lhg/README.md) 参照。 |
 
 3 つのデモはいずれも、`bash setup.sh` と `bash download_assets.sh` が
 正常に完了しており、`conda activate HRAvatar` が有効な状態を前提にしています。
@@ -195,3 +199,40 @@ global/neck/jaw pose in degrees, eyelids, translation の数値サマリ)、
 
 overlay style は
 `MTamon/smirk@release/cuda128/demos/demo_video.py --show_vertices` に合わせています。
+
+## 4. LHG (Listening Head Generation) 特徴量抽出
+
+`demos/extract_lhg_features.sh` と `demos/render_lhg_features.sh` は
+LHG 用の Stage 1/2/3 preprocessing パイプラインに属するスクリプトです。
+avatar fit の `tracked_params.json` は **clip 定数 calibration**
+(`world_mat` / `shapecode` / `intrinsics`) としてのみ消費し、
+**完全 causal pipeline** で per-frame の `lhg_features.npz` を生成します
+(MediaPipe video mode → SMIRK → cv2.solvePnP EPnP → causal Hampel →
+rotation/translation への symmetric FIR LPF。jaw への LPF は opt-in)。
+
+最短ワークフロー (Stage 1 を被写体ごとに 1 回、Stage 2 をクリップごとに):
+
+```bash
+# Stage 1 (1 被写体 1 回): demo 1 と同じ _preprocess_subject.sh を
+# 新規 --lhg-only flag 付きで実行 (matting / albedo を skip)
+bash demos/_preprocess_subject.sh \
+    --sbj-root data/lhg --sbj-name MKt3lhg \
+    --video data/row/mikawa_test3.mp4 --intrinsics hdtf \
+    --lhg-only
+
+# Stage 2 (各クリップ): per-frame 特徴量抽出
+bash demos/extract_lhg_features.sh \
+    --video data/lhg/MKt3lhg/image \
+    --calibration data/lhg/MKt3lhg/tracked_params.json \
+    --output data/lhg/MKt3lhg/lhg_features.npz \
+    --mode online
+
+# レンダーデモ: アバター × lhg_features.npz → MP4 (視覚検証)
+bash demos/render_lhg_features.sh \
+    --avatar  outputs/custom/MK6cP \
+    --source  data/lhg/MKt3lhg \
+    --lhg-features data/lhg/MKt3lhg/lhg_features.npz
+```
+
+CLI flag、出力スキーマ、アーキテクチャの詳細は
+[`lhg/README.md`](../lhg/README.md) を参照してください。

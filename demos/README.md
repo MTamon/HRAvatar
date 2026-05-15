@@ -4,12 +4,16 @@ Language: English | [日本語](README.ja.md)
 
 Three demos are provided, mirroring the demo layout used by the companion
 MTamon branches (`MTamon/DECA@release/cuda128`, `MTamon/smirk@release/cuda128`).
+A separate **LHG (Listening Head Generation)** preprocessing pipeline lives
+under [`lhg/`](../lhg/README.md) — its own README documents the Stage 1/2/3
+workflow.
 
 | # | Script                              | Purpose                                                                 |
 |---|-------------------------------------|-------------------------------------------------------------------------|
 | 1 | `demo_1_train_subject.sh`           | End-to-end training of HRAvatar on a single subject's video.            |
 | 2 | `demo_2_cross_reenactment.sh`       | Drive a trained HRAvatar with a **different** person's extracted FLAME. |
 | 3 | `demo_3_overlay_tracking.py`        | Visualize the **post-optimize** features HRAvatar's renderer actually receives (FLAME vertices + landmarks + params card), overlaid on the source frames. |
+| 4 | `extract_lhg_features.sh` + `render_lhg_features.sh` | LHG feature extraction (Stage 2) and visual rendering verification. See [`lhg/README.md`](../lhg/README.md). |
 
 All three demos assume `bash setup.sh` and `bash download_assets.sh` have
 been executed successfully and `conda activate HRAvatar` is live.
@@ -199,3 +203,40 @@ degrees, eyelids, translation), `all` (vertices + landmarks + card).
 
 The overlay style mirrors
 `MTamon/smirk@release/cuda128/demos/demo_video.py --show_vertices`.
+
+## 4. LHG (Listening Head Generation) feature extraction
+
+`demos/extract_lhg_features.sh` and `demos/render_lhg_features.sh` belong
+to a separate Stage 1/2/3 preprocessing pipeline for LHG that consumes
+the avatar fit's `tracked_params.json` only as a clip-constant
+calibration (`world_mat` / `shapecode` / `intrinsics`) and produces a
+per-frame `lhg_features.npz` via a **strictly causal** pipeline
+(MediaPipe video mode → SMIRK → cv2.solvePnP EPnP → causal Hampel →
+symmetric FIR LPF on rotation/translation, with optional jaw LPF).
+
+Headline workflow (one Stage 1 per subject, one Stage 2 per clip):
+
+```bash
+# Stage 1 (one-time per subject): the same _preprocess_subject.sh used
+# by demo 1 with the new --lhg-only flag (skips matting + albedo).
+bash demos/_preprocess_subject.sh \
+    --sbj-root /data/lhg --sbj-name alice \
+    --video /data/raw/alice.mp4 --intrinsics hdtf \
+    --lhg-only
+
+# Stage 2 (per clip): per-frame feature extraction.
+bash demos/extract_lhg_features.sh \
+    --video /data/lhg/alice/image \
+    --calibration /data/lhg/alice/tracked_params.json \
+    --output /data/lhg/alice/lhg_features.npz \
+    --mode online
+
+# Render demo: avatar × lhg_features.npz → MP4 (visual verification).
+bash demos/render_lhg_features.sh \
+    --avatar  outputs/custom/alice \
+    --source  /data/lhg/alice \
+    --lhg-features /data/lhg/alice/lhg_features.npz
+```
+
+Full flag reference, output schema, and architecture notes are in
+[`lhg/README.md`](../lhg/README.md).

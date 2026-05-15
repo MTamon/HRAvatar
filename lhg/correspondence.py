@@ -116,6 +116,45 @@ def load(path: str | Path = DEFAULT_ASSET) -> MediaPipeFLAMECorrespondence:
 
 DEFAULT_FLAME_MODEL_PATH = Path('./assets/FLAME2020/generic_model.pkl')
 
+# FLAME 2020's shapedirs has 300 shape basis + 100 expression basis
+# concatenated along the last axis.
+_FLAME_SHAPE_DIM = 300
+
+
+def _load_flame_canonical(flame_model_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read ``v_template``, ``shapedirs``, and ``faces`` from generic_model.pkl."""
+    import pickle
+
+    if not flame_model_path.is_file():
+        raise FileNotFoundError(
+            f'FLAME model not found: {flame_model_path}. Required for '
+            f'shape-aware EPnP. Place ``generic_model.pkl`` from FLAME 2020 '
+            f'release at this path, or pass ``flame_model_path`` explicitly.')
+    with open(flame_model_path, 'rb') as f:
+        fm = pickle.load(f, encoding='latin1')
+
+    def _to_np(x):
+        return np.asarray(x.r) if hasattr(x, 'r') else np.asarray(x)
+
+    v_template = _to_np(fm['v_template']).astype(np.float64)    # (V, 3)
+    shapedirs = _to_np(fm['shapedirs']).astype(np.float64)      # (V, 3, 300+100)
+    faces = _to_np(fm['f']).astype(np.int64)                    # (F, 3)
+    return v_template, shapedirs, faces
+
+
+def _landmark_xyz(
+    verts: np.ndarray,
+    correspondence: MediaPipeFLAMECorrespondence,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Apply the barycentric mapping to extract K landmark positions."""
+    tri = faces[correspondence.flame_face_idx]      # (K, 3)
+    v0 = verts[tri[:, 0]]
+    v1 = verts[tri[:, 1]]
+    v2 = verts[tri[:, 2]]
+    b = correspondence.flame_bary
+    return b[:, 0:1] * v0 + b[:, 1:2] * v1 + b[:, 2:3] * v2
+
 
 def build_shape_aware_landmarks(
     correspondence: MediaPipeFLAMECorrespondence,
@@ -138,36 +177,96 @@ def build_shape_aware_landmarks(
     are zero in this canonical state, so plain ``v_template +
     shapedirs @ shapecode`` is exact.
     """
-    import pickle
-
-    path = Path(flame_model_path)
-    if not path.is_file():
-        raise FileNotFoundError(
-            f'FLAME model not found: {path}. Required for shape-aware EPnP. '
-            f'Place ``generic_model.pkl`` from FLAME 2020 release at this '
-            f'path, or pass ``flame_model_path`` explicitly.')
-    with open(path, 'rb') as f:
-        fm = pickle.load(f, encoding='latin1')
-
-    def _to_np(x):
-        return np.asarray(x.r) if hasattr(x, 'r') else np.asarray(x)
-
-    v_template = _to_np(fm['v_template'])           # (V, 3)
-    shapedirs = _to_np(fm['shapedirs'])             # (V, 3, 300+100)
-    faces = _to_np(fm['f']).astype(np.int64)        # (F, 3)
-
+    v_template, shapedirs, faces = _load_flame_canonical(Path(flame_model_path))
     shape_coeffs = np.asarray(shapecode, dtype=np.float64).reshape(-1)
     n_shape = shape_coeffs.size
-    if n_shape > shapedirs.shape[2]:
+    if n_shape > _FLAME_SHAPE_DIM:
         raise ValueError(
-            f'shapecode length {n_shape} exceeds shapedirs capacity '
-            f'{shapedirs.shape[2]}')
+            f'shapecode length {n_shape} exceeds FLAME shape dim '
+            f'{_FLAME_SHAPE_DIM}')
     shape_blend = np.einsum('vsd,d->vs', shapedirs[:, :, :n_shape], shape_coeffs)
-    verts = (v_template + shape_blend).astype(np.float64)
+    verts = v_template + shape_blend
+    return _landmark_xyz(verts, correspondence, faces)
 
-    tri = faces[correspondence.flame_face_idx]      # (K, 3)
-    v0 = verts[tri[:, 0]]
-    v1 = verts[tri[:, 1]]
-    v2 = verts[tri[:, 2]]
-    b = correspondence.flame_bary
-    return (b[:, 0:1] * v0 + b[:, 1:2] * v1 + b[:, 2:3] * v2).astype(np.float64)
+
+class ExpressionAwareLandmarkComputer:
+    """Build EPnP object points per-frame as ``shape (clip-constant) + expression (per-frame)``.
+
+    The clip-constant ``shape`` template is computed once at construction
+    time from the Stage 1 ``shapecode`` (matching
+    ``build_shape_aware_landmarks``). The 16 landmark positions can then
+    be cheaply updated per frame using SMIRK's expression output, since
+    the expression basis at the landmark locations is also pre-computed
+    once. This removes the residual systematic bias that
+    expression-neutral templates leave behind: a mouth-open frame's
+    lower-face landmarks really are shifted, and EPnP overcompensates
+    when fitting the open-mouth observation to a closed-mouth template.
+
+    Pose blendshape (jaw / neck / eye joint rotation correction terms)
+    is intentionally omitted — those depend on the pose we are TRYING to
+    solve for, which would couple EPnP to a fixed-point iteration. The
+    expression-only correction handles the dominant per-frame deviation
+    (mouth open/close, smile, brow raise) without that coupling.
+    """
+
+    def __init__(
+        self,
+        correspondence: MediaPipeFLAMECorrespondence,
+        shapecode: np.ndarray,
+        n_expression: int,
+        flame_model_path: str | Path = DEFAULT_FLAME_MODEL_PATH,
+    ):
+        v_template, shapedirs, faces = _load_flame_canonical(Path(flame_model_path))
+        shape_coeffs = np.asarray(shapecode, dtype=np.float64).reshape(-1)
+        n_shape = shape_coeffs.size
+        if n_shape > _FLAME_SHAPE_DIM:
+            raise ValueError(
+                f'shapecode length {n_shape} exceeds FLAME shape dim '
+                f'{_FLAME_SHAPE_DIM}')
+        expr_dim_avail = shapedirs.shape[2] - _FLAME_SHAPE_DIM
+        if n_expression > expr_dim_avail:
+            raise ValueError(
+                f'requested {n_expression} expression dims but FLAME has '
+                f'only {expr_dim_avail} expression basis vectors')
+
+        # 1) clip-constant shape-aware landmark positions (K, 3)
+        shape_blend = np.einsum('vsd,d->vs', shapedirs[:, :, :n_shape], shape_coeffs)
+        verts_shape = v_template + shape_blend
+        self._lm_shape_only = _landmark_xyz(verts_shape, correspondence, faces)
+
+        # 2) expression basis evaluated AT the landmark positions: (K, 3, E)
+        # Each landmark is a fixed barycentric combination of three vertices,
+        # so the expression direction at the landmark is the matching
+        # combination of the per-vertex expression directions.
+        expr_dirs_vert = shapedirs[:, :, _FLAME_SHAPE_DIM:_FLAME_SHAPE_DIM + n_expression]
+        tri = faces[correspondence.flame_face_idx]
+        b = correspondence.flame_bary
+        d0 = expr_dirs_vert[tri[:, 0]]   # (K, 3, E)
+        d1 = expr_dirs_vert[tri[:, 1]]
+        d2 = expr_dirs_vert[tri[:, 2]]
+        self._expr_dirs_at_lm = (
+            b[:, 0:1, None] * d0 + b[:, 1:2, None] * d1 + b[:, 2:3, None] * d2
+        )
+        self._n_expression = int(n_expression)
+
+    @property
+    def n_expression(self) -> int:
+        return self._n_expression
+
+    @property
+    def shape_only(self) -> np.ndarray:
+        """Clip-constant shape-only landmark positions (K, 3)."""
+        return self._lm_shape_only
+
+    def apply_expression(self, expression: np.ndarray) -> np.ndarray:
+        """Return (K, 3) landmark positions for the given expression vector.
+
+        ``expression`` is the SMIRK per-frame output of length
+        ``n_expression`` (typically 50).
+        """
+        e = np.asarray(expression, dtype=np.float64).reshape(-1)
+        if e.size != self._n_expression:
+            raise ValueError(
+                f'expression length {e.size} != computer n_expression '
+                f'{self._n_expression}')
+        return self._lm_shape_only + np.einsum('ksd,d->ks', self._expr_dirs_at_lm, e)

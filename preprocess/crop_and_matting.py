@@ -216,11 +216,13 @@ class Crop_and_matting(Dataset, ABC):
         print("Finish face parsing.")
     
     def merge_maks(self,image_path,mask_path,seg_path):
-        # Get the list of files
-        rgb_files = sorted(os.listdir(image_path))
-        mask_files = sorted(os.listdir(mask_path))
+        # natural_sort_key tolerates mixed digit widths across the three
+        # dirs (lex sort breaks once any of them contains both 4- and 5-
+        # digit zero-pad names).
+        rgb_files = sorted(os.listdir(image_path), key=natural_sort_key)
+        mask_files = sorted(os.listdir(mask_path), key=natural_sort_key)
 
-        seg_files = sorted(os.listdir(seg_path))
+        seg_files = sorted(os.listdir(seg_path), key=natural_sort_key)
 
         print("Merging mask...")
         # Process each pair of files

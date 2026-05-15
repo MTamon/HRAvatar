@@ -55,6 +55,10 @@
 #                        if optimize_vis.jpg shows alien-looking enlarged
 #                        head / collapsed face. See doc/deca_patches.md.
 #   --lambda-exp F       DECA optimize.py expression regularizer (default 1e-2)
+#   --lambda-pose-diff F DECA optimize.py per-frame pose temporal smoothing
+#                        weight (default 10). Raise to 30-50 to suppress
+#                        per-frame pose jitter that can show up as a
+#                        translucent ghost moving with the head.
 #   --max-iters N        DECA optimize.py main-loop iter cap (default 1000 =
 #                        original HRAvatar fork). Lower to short-circuit the
 #                        slow tail of the per-frame photometric refinement.
@@ -131,6 +135,7 @@ INTRINSICS=""
 : "${BBOX_CENTER_PASSTHROUGH:=0}"
 : "${LAMBDA_SHAPE:=}"
 : "${LAMBDA_EXP:=}"
+: "${LAMBDA_POSE_DIFF:=}"
 : "${MAX_ITERS:=}"
 : "${MAX_IRIS_ITERS:=}"
 : "${EARLY_STOP_REL_TOL:=}"
@@ -181,8 +186,9 @@ while [[ $# -gt 0 ]]; do
     --bbox-center-k-of-n)       require_value "$@"; BBOX_CENTER_K_OF_N="$2"; shift 2 ;;
     --bbox-center-tau)          require_value "$@"; BBOX_CENTER_TAU="$2"; shift 2 ;;
     --bbox-center-passthrough)  BBOX_CENTER_PASSTHROUGH=1; shift ;;
-    --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
-    --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --lambda-shape)        require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
+    --lambda-exp)          require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --lambda-pose-diff)    require_value "$@"; LAMBDA_POSE_DIFF="$2"; shift 2 ;;
     --max-iters)             require_value "$@"; MAX_ITERS="$2"; shift 2 ;;
     --max-iris-iters)        require_value "$@"; MAX_IRIS_ITERS="$2"; shift 2 ;;
     --early-stop-rel-tol)    require_value "$@"; EARLY_STOP_REL_TOL="$2"; shift 2 ;;
@@ -268,6 +274,9 @@ if [[ "${SKIP_PREPROCESS}" != "1" ]]; then
   fi
   if [[ -n "${LAMBDA_EXP}" ]]; then
     PREPROCESS_FLAGS+=(--lambda-exp "${LAMBDA_EXP}")
+  fi
+  if [[ -n "${LAMBDA_POSE_DIFF}" ]]; then
+    PREPROCESS_FLAGS+=(--lambda-pose-diff "${LAMBDA_POSE_DIFF}")
   fi
   if [[ -n "${MAX_ITERS}" ]]; then
     PREPROCESS_FLAGS+=(--max-iters "${MAX_ITERS}")

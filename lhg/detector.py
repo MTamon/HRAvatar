@@ -3,6 +3,22 @@
 Reuses the same detector configuration as ``preprocess/stable_bbox.py``
 and ``scene/data_loader.py`` so the LHG path produces stable subset
 landmarks consistent with the rest of the codebase.
+
+Running modes
+-------------
+The wrapper exposes both ``image`` and ``video`` running modes:
+
+* ``video`` (default for Stage 2): MediaPipe runs an internal Kalman
+  tracker across frames, smoothing per-frame jitter and skipping the
+  expensive face re-detection step on frames where the previous bbox
+  is still valid. Requires monotonically increasing ``timestamp_ms``
+  (handled by the caller using ``frame_index / fps``). Reduces
+  per-frame depth std markedly without altering the absolute
+  landmark accuracy ceiling.
+
+* ``image`` (default in legacy code paths): each ``detect()`` is an
+  independent call. Used as the per-frame-noise baseline in the
+  Stage 2 verification A/B test.
 """
 from __future__ import annotations
 
@@ -25,7 +41,11 @@ class MediaPipeFaceLandmarker:
     truth on per-frame Z that callers might accidentally read.
     """
 
-    def __init__(self, asset_path: str | Path = _DEFAULT_ASSET):
+    def __init__(
+        self,
+        asset_path: str | Path = _DEFAULT_ASSET,
+        running_mode: str = 'video',
+    ):
         from mediapipe.tasks import python
         from mediapipe.tasks.python import vision
 
@@ -36,9 +56,19 @@ class MediaPipeFaceLandmarker:
                 f'Run the asset download step from the repo README, or pass '
                 f'an explicit asset_path to MediaPipeFaceLandmarker().')
 
+        if running_mode not in ('image', 'video'):
+            raise ValueError(
+                f'running_mode must be "image" or "video", got {running_mode!r}')
+        self.running_mode = running_mode
+
+        if running_mode == 'video':
+            mode = vision.RunningMode.VIDEO
+        else:
+            mode = vision.RunningMode.IMAGE
         base_options = python.BaseOptions(model_asset_path=str(asset_path))
         options = vision.FaceLandmarkerOptions(
             base_options=base_options,
+            running_mode=mode,
             output_face_blendshapes=False,
             output_facial_transformation_matrixes=False,
             num_faces=1,
@@ -47,8 +77,22 @@ class MediaPipeFaceLandmarker:
         )
         self._detector = vision.FaceLandmarker.create_from_options(options)
 
-    def detect(self, image_rgb: np.ndarray) -> np.ndarray | None:
+    def detect(
+        self,
+        image_rgb: np.ndarray,
+        timestamp_ms: int | None = None,
+    ) -> np.ndarray | None:
         """Run detection on a uint8 (H, W, 3) RGB image.
+
+        Parameters
+        ----------
+        image_rgb : (H, W, 3) uint8 RGB.
+        timestamp_ms : monotonically increasing per-frame timestamp in
+            milliseconds. Required when ``running_mode='video'``;
+            ignored otherwise. The caller is responsible for
+            generating the timestamp (typically ``int(frame_index *
+            1000 / fps)``); MediaPipe's video mode uses it to feed
+            the internal Kalman tracker.
 
         Returns
         -------
@@ -63,7 +107,15 @@ class MediaPipeFaceLandmarker:
             raise ValueError(f'image_rgb must be (H, W, 3), got {image_rgb.shape}')
 
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
-        result = self._detector.detect(mp_image)
+        if self.running_mode == 'video':
+            if timestamp_ms is None:
+                raise ValueError(
+                    'timestamp_ms is required in video running_mode '
+                    '(int milliseconds, monotonically increasing).')
+            result = self._detector.detect_for_video(mp_image, int(timestamp_ms))
+        else:
+            result = self._detector.detect(mp_image)
+
         if not result.face_landmarks:
             return None
 

@@ -555,11 +555,57 @@ def extract_optimized_params( cam_params_train,cam_params_test, gaussians,data_p
     fjson.close()
     print("Done!")
 
+def _maybe_lhg_override(args):
+    """Build the in-memory ``tracked_params`` override from
+    ``--lhg-features`` (LHG render demo) or return ``(None, None)``.
+
+    The override completely replaces per-frame entries with values
+    from ``lhg_features.npz`` while keeping ``shapecode`` from the
+    base ``tracked_params.json`` at ``--source_path``.
+    """
+    npz_path = getattr(args, 'lhg_features', None)
+    if not npz_path:
+        return None, None
+    import json as _json
+    from lhg.output import LHGFeatures
+    from lhg.render_adapter import features_to_tracked_params
+
+    base_path = os.path.join(args.source_path, 'tracked_params.json')
+    flame_scale = 4.0
+    if not os.path.exists(base_path):
+        alt = os.path.join(args.source_path, 'tracked_params_v2.json')
+        if os.path.exists(alt):
+            base_path = alt
+            flame_scale = 1.0
+        else:
+            base_path = None
+    base_dict = None
+    if base_path is not None:
+        with open(base_path) as fp:
+            base_dict = _json.load(fp)
+    features = LHGFeatures.read(npz_path)
+    flame_scale = float(features.flame_scale)
+    override = features_to_tracked_params(features, base_tracked_params=base_dict)
+    print(f'[render] LHG override active: {npz_path} '
+          f'({features.frame_basenames.shape[0]} frames, '
+          f'flame_scale={flame_scale})')
+    return override, flame_scale
+
+
 def render_sets(dataset_args : ModelParams, epoch : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool,all_args):
     with torch.no_grad():
         gaussians = GaussianHeadModel(dataset_args.sh_degree,all_args)
-        _train_dataset=TrackedData(args.source_path,args,split='train',pre_load=True)
-        _test_dataset=TrackedData(args.source_path,args,split='test',pre_load=True)
+        lhg_override, lhg_flame_scale = _maybe_lhg_override(all_args)
+        _train_dataset=TrackedData(
+            args.source_path,args,split='train',pre_load=True,
+            tracked_params_override=lhg_override,
+            flame_scale_override=lhg_flame_scale,
+        )
+        _test_dataset=TrackedData(
+            args.source_path,args,split='test',pre_load=True,
+            tracked_params_override=lhg_override,
+            flame_scale_override=lhg_flame_scale,
+        )
         train_dataset=[_data for _data in _train_dataset]
         test_dataset=[_data for _data in _test_dataset]
         
@@ -670,6 +716,15 @@ if __name__ == "__main__":
     parser.add_argument("--test_rendering_speed", action="store_true", default=False,
                         help="Run the rendering-speed measurement only, then exit. "
                              "Writes <model_path>/rendering_speed.json and prints a one-line summary.")
+    parser.add_argument("--lhg-features", "--lhg_features", dest="lhg_features",
+                        type=str, default=None,
+                        help="Path to a lhg_features.npz produced by "
+                             "lhg/extract.py (Stage 2). When set, the per-frame "
+                             "tracker payload of TrackedData is replaced by "
+                             "values from this file (see lhg/render_adapter.py). "
+                             "shapecode is still taken from --source_path's "
+                             "tracked_params.json so the avatar's baked shape "
+                             "stays consistent. Used by demos/render_lhg_features.sh.")
     parser=add_more_argument(parser)
     args = get_combined_args(parser,model)
 

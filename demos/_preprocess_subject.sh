@@ -53,6 +53,14 @@ Optional flags:
                          to. Do NOT change unless you also rebuild the
                          intrinsics preset for the new resolution.
   --with-albedo          run IntrinsicAnything for albedo GT   (default off)
+  --lhg-only             produce only the artifacts that LHG (Listening Head
+                         Generation) Stage 2 needs (tracked_params.json
+                         world_mat / shapecode / intrinsics + outer-cropped
+                         image/ + outer_offset.json). Skips matting,
+                         clothes mask, and IntrinsicAnything albedo, since
+                         those are HRAvatar avatar-fit-only artifacts that
+                         LHG Stage 2 (lhg/extract.py) does not consume.
+                         Cuts wall time roughly in half.            (default off)
   --no-stable-bbox       skip the stable bbox preprocess step  (default on)
   --no-prescale          skip ffmpeg short-side rescaling      (default on)
                          When prescale is on, frames are extracted at
@@ -85,6 +93,13 @@ Optional flags:
                          fix alien-looking enlarged head / collapsed face in
                          optimize_vis.jpg. Requires DECA optimize patcher.)
   --lambda-exp F         DECA optimize.py exp regularizer      (default 1e-2)
+  --lambda-pose-diff F   DECA optimize.py per-frame pose temporal smoothing
+                         weight on mean(square(pose[1:]-pose[:-1]))   (default 10).
+                         Raise to 30-50 to suppress per-frame pose jitter that
+                         can manifest as a translucent ghost moving with the
+                         head when shape vector is near the regularization
+                         boundary. The flag is native to DECA optimize.py and
+                         does not require a patcher.
   --max-iters N          DECA optimize.py main-loop iter cap   (default 1000,
                          the original HRAvatar fork value. The main loop is
                          NOT early-stopped; if you want it shorter, lower
@@ -137,6 +152,7 @@ FPS=30
 RESIZE=720
 IMAGE_SIZE=512
 WITH_ALBEDO=0
+LHG_ONLY=0
 STABLE_BBOX=1
 NO_PRESCALE=0
 BBOX_VERIFY=0
@@ -150,6 +166,7 @@ BBOX_CENTER_TAU=""
 BBOX_CENTER_PASSTHROUGH=0
 LAMBDA_SHAPE=""
 LAMBDA_EXP=""
+LAMBDA_POSE_DIFF=""
 MAX_ITERS=""
 MAX_IRIS_ITERS=""
 EARLY_STOP_REL_TOL=""
@@ -179,6 +196,7 @@ while [[ $# -gt 0 ]]; do
     --resize)          require_value "$@"; RESIZE="$2"; shift 2 ;;
     --image-size|--image_size) require_value "$@"; IMAGE_SIZE="$2"; shift 2 ;;
     --with-albedo|--with_albedo) WITH_ALBEDO=1; shift ;;
+    --lhg-only|--lhg_only) LHG_ONLY=1; shift ;;
     --no-stable-bbox)  STABLE_BBOX=0; shift ;;
     --no-prescale)     NO_PRESCALE=1; shift ;;
     --bbox-verify)     BBOX_VERIFY=1; shift ;;
@@ -190,8 +208,9 @@ while [[ $# -gt 0 ]]; do
     --bbox-center-k-of-n)       require_value "$@"; BBOX_CENTER_K_OF_N="$2"; shift 2 ;;
     --bbox-center-tau)          require_value "$@"; BBOX_CENTER_TAU="$2"; shift 2 ;;
     --bbox-center-passthrough)  BBOX_CENTER_PASSTHROUGH=1; shift ;;
-    --lambda-shape)    require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
-    --lambda-exp)      require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --lambda-shape)        require_value "$@"; LAMBDA_SHAPE="$2"; shift 2 ;;
+    --lambda-exp)          require_value "$@"; LAMBDA_EXP="$2"; shift 2 ;;
+    --lambda-pose-diff)    require_value "$@"; LAMBDA_POSE_DIFF="$2"; shift 2 ;;
     --max-iters)             require_value "$@"; MAX_ITERS="$2"; shift 2 ;;
     --max-iris-iters)        require_value "$@"; MAX_IRIS_ITERS="$2"; shift 2 ;;
     --early-stop-rel-tol)    require_value "$@"; EARLY_STOP_REL_TOL="$2"; shift 2 ;;
@@ -223,6 +242,17 @@ if [[ -z "${ROOT}" || -z "${NAME}" || -z "${VIDEO}" || -z "${INTRINSICS}" ]]; th
   exit 2
 fi
 
+# --lhg-only forces off the avatar-fit-only artifacts (matting / albedo).
+# Anything LHG Stage 2 (lhg/extract.py) reads from tracked_params.json
+# (world_mat, shapecode, intrinsics) and the outer-cropped image/ folder
+# is still produced.
+if [[ "${LHG_ONLY}" == "1" ]]; then
+  if [[ "${WITH_ALBEDO}" == "1" ]]; then
+    echo "[preprocess] --lhg-only set: ignoring --with-albedo (IntrinsicAnything skipped)" >&2
+  fi
+  WITH_ALBEDO=0
+fi
+
 : "${CUDA_VISIBLE_DEVICES:=0}"
 export CUDA_VISIBLE_DEVICES
 
@@ -247,7 +277,11 @@ if [[ ! -f "${DATA_DIR}/${NAME}.mp4" ]]; then
   ln -sf "$(realpath "${VIDEO}")" "${DATA_DIR}/${NAME}.mp4"
 fi
 
-echo "[preprocess 1/5] crop + matting"
+if [[ "${LHG_ONLY}" == "1" ]]; then
+  echo "[preprocess 1/5] crop (LHG-only: matting + clothes mask skipped)"
+else
+  echo "[preprocess 1/5] crop + matting"
+fi
 CROP_EXTRA_ARGS=()
 if [[ "${NO_PRESCALE}" == "1" ]]; then
   CROP_EXTRA_ARGS+=(--no_prescale)
@@ -255,11 +289,21 @@ fi
 if [[ -n "${OUTER_BBOX_SCALE}" ]]; then
   CROP_EXTRA_ARGS+=(--bbox_scale "${OUTER_BBOX_SCALE}")
 fi
+# LHG-only path drops `--matting` (no rvm alpha generation) and forces
+# `--mask_clothes False` (skips Mediapipe selfie segmentation). The
+# outer crop itself stays on so we still produce image/ + outer_offset.json
+# at the same coordinate system the intrinsics preset is pinned to.
+if [[ "${LHG_ONLY}" == "1" ]]; then
+  MATTING_ARGS=(--mask_clothes False)
+else
+  MATTING_ARGS=(--matting --mask_clothes True)
+fi
 python preprocess/crop_and_matting.py \
     --source "${ROOT}" --name "${NAME}" --fps "${FPS}" \
     --image_size "${IMAGE_SIZE}" "${IMAGE_SIZE}" \
     --prescale_short_side "${RESIZE}" \
-    --matting --crop_image --mask_clothes True \
+    --crop_image \
+    "${MATTING_ARGS[@]}" \
     ${CROP_EXTRA_ARGS[@]+"${CROP_EXTRA_ARGS[@]}"}
 
 DECA_PRECOMPUTED_BBOX_ARG=""
@@ -339,6 +383,9 @@ if [[ -n "${LAMBDA_SHAPE}" ]]; then
 fi
 if [[ -n "${LAMBDA_EXP}" ]]; then
   DECA_OPTIMIZE_EXTRA_ARGS+=(--lambda_exp "${LAMBDA_EXP}")
+fi
+if [[ -n "${LAMBDA_POSE_DIFF}" ]]; then
+  DECA_OPTIMIZE_EXTRA_ARGS+=(--lambda_pose_diff "${LAMBDA_POSE_DIFF}")
 fi
 if [[ -n "${MAX_ITERS}" ]]; then
   DECA_OPTIMIZE_EXTRA_ARGS+=(--max_iters "${MAX_ITERS}")

@@ -75,13 +75,21 @@ class Camera_params():
         self.image_name=image_name
     
 class TrackedData(torch.utils.data.Dataset):
-    def __init__(self, path,args,split,pre_load=True,load_image=True,device='cpu'):
+    def __init__(self, path,args,split,pre_load=True,load_image=True,device='cpu',
+                 tracked_params_override=None,flame_scale_override=None):
+        """``tracked_params_override`` lets callers (e.g. the LHG render
+        demo) substitute the per-frame tracker payload without
+        modifying the on-disk ``tracked_params.json``. When given,
+        the JSON file is NOT read; ``flame_scale_override`` should
+        accompany the override so the FLAME convention (4.0 for v1,
+        1.0 for v2) is set explicitly (defaults to 4.0).
+        """
         self.args=args
         self.pre_load=pre_load
         self.load_image=load_image
         self.device=device
-        
-        
+
+
         if os.path.isdir(path):
             images_path = os.path.join(path, "image")
             mask_prepath = os.path.join(path, "mask")
@@ -91,13 +99,20 @@ class TrackedData(torch.utils.data.Dataset):
             print('total {} images'.format(len(imagepath_list)))
             imagepath_list = natsorted(imagepath_list)
 
-        tracked_params_path = os.path.join(path, "tracked_params.json")
-        self.flame_scale = 4.0
-        if not os.path.exists(tracked_params_path):
-            tracked_params_path = os.path.join(path, "tracked_params_v2.json")
-            self.flame_scale = 1.0
-        with open(tracked_params_path) as json_file:
-            tracked_params_dict = json.load(json_file)
+        if tracked_params_override is not None:
+            tracked_params_dict = tracked_params_override
+            self.flame_scale = (
+                float(flame_scale_override)
+                if flame_scale_override is not None else 4.0
+            )
+        else:
+            tracked_params_path = os.path.join(path, "tracked_params.json")
+            self.flame_scale = 4.0
+            if not os.path.exists(tracked_params_path):
+                tracked_params_path = os.path.join(path, "tracked_params_v2.json")
+                self.flame_scale = 1.0
+            with open(tracked_params_path) as json_file:
+                tracked_params_dict = json.load(json_file)
 
         train_set_len = int(len(imagepath_list) * (1 - args.test_set_ratio))
         if args.test_set_num != -1:
