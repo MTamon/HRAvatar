@@ -13,6 +13,10 @@ Modes (``--mode``)
 ``mesh``         — FLAME mesh vertex projected with the npz's pose +
                    shape + expression. Drawn as small dots so per-frame
                    jitter is visible.
+``wireframe``    — FLAME mesh triangle edges projected to 2D. Far
+                   easier to read than dots: the face contour and the
+                   eye / nose / mouth structure are drawn as lines, so
+                   whether the mesh sits on the face is obvious.
 ``bbox``         — ``stable_bbox.npz`` (center, size) → outer-crop
                    rectangle. Visualises the SMIRK 224 crop region.
 ``landmarks``    — face-alignment 68 pt landmarks read from
@@ -20,7 +24,12 @@ Modes (``--mode``)
                    was fit against).
 ``params_card``  — numerical summary (rotation magnitude in deg,
                    translation z, expression norm, etc.) in the top-left.
-``all``          — everything together (default).
+``all``          — mesh + bbox + landmarks + params_card together (default).
+
+``--face-only`` restricts the mesh / wireframe to the FLAME ``face``
+region (1787 of 5023 vertices, from ``assets/flame_model/FLAME_masks.pkl``)
+so the cheeks-ears-scalp-neck vertices that fall outside the visible
+face are dropped.
 
 This script reuses ``demos.demo_3_overlay_tracking``'s FLAME forward
 and projection helpers, so the overlay geometry matches the rest of
@@ -62,9 +71,62 @@ from demos.demo_3_overlay_tracking import (  # noqa: E402
     pose_flame,
     project,
     draw_vertices,
-    draw_landmarks,
 )
 from lhg.output import LHGFeatures  # noqa: E402
+
+
+def _draw_wireframe(
+    img: np.ndarray,
+    uv: np.ndarray,
+    triangles: np.ndarray,
+    color: tuple,
+) -> np.ndarray:
+    """Draw triangle edges of a projected mesh.
+
+    Unlike ``demos.demo_3_overlay_tracking.draw_wireframe``, this does
+    NOT z-cull: that helper assumes ``z < 0`` is front-facing, but the
+    ``project()`` helper returns a positive camera-frame z (it applies
+    ``FLIP_YZ`` to world_mat first), so every triangle would be
+    discarded. ``--face-only`` already restricts triangles to the
+    front of the face, so a plain edge draw with an in-frame check is
+    both correct and fast.
+    """
+    h, w = img.shape[:2]
+    out = img.copy()
+    for a, b, c in triangles:
+        pa = (int(round(uv[a, 0])), int(round(uv[a, 1])))
+        pb = (int(round(uv[b, 0])), int(round(uv[b, 1])))
+        pc = (int(round(uv[c, 0])), int(round(uv[c, 1])))
+        # skip triangles entirely outside the frame
+        if all(not (0 <= x < w and 0 <= y < h) for x, y in (pa, pb, pc)):
+            continue
+        cv2.line(out, pa, pb, color, 1, cv2.LINE_AA)
+        cv2.line(out, pb, pc, color, 1, cv2.LINE_AA)
+        cv2.line(out, pc, pa, color, 1, cv2.LINE_AA)
+    return out
+
+
+def _load_face_vertex_mask(n_vertices: int) -> np.ndarray:
+    """Boolean (n_vertices,) mask of the FLAME ``face`` region.
+
+    Reads ``assets/flame_model/FLAME_masks.pkl``; the ``face`` entry
+    is a list of 1787 vertex indices covering the front of the face
+    (excludes ears / scalp / neck). Used by --face-only to drop the
+    mesh vertices that project outside the visible face.
+    """
+    import pickle
+
+    masks_path = REPO_ROOT / 'assets' / 'flame_model' / 'FLAME_masks.pkl'
+    if not masks_path.is_file():
+        raise FileNotFoundError(
+            f'FLAME_masks.pkl not found at {masks_path}; cannot use '
+            f'--face-only.')
+    with open(masks_path, 'rb') as f:
+        masks = pickle.load(f, encoding='latin1')
+    face_idx = np.asarray(masks['face'], dtype=np.int64)
+    mask = np.zeros(n_vertices, dtype=bool)
+    mask[face_idx[face_idx < n_vertices]] = True
+    return mask
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,8 +139,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--output', required=True, type=str,
                    help='Output mp4 path')
     p.add_argument('--mode',
-                   choices=('all', 'mesh', 'landmarks', 'bbox', 'params_card'),
+                   choices=('all', 'mesh', 'wireframe', 'landmarks',
+                            'bbox', 'params_card'),
                    default='all')
+    p.add_argument('--face-only', action='store_true',
+                   help='Restrict mesh / wireframe to the FLAME face '
+                        'region (drops ears / scalp / neck vertices).')
     p.add_argument('--shapecode-json', default=None, type=str,
                    help='Path to a shapecode sidecar JSON (the file '
                         'lhg.teacher writes alongside the npz). Defaults '
@@ -297,8 +363,29 @@ def main() -> None:
     shapecode_np = _resolve_shapecode(features, args)
     shape = torch.from_numpy(shapecode_np).unsqueeze(0).to(args.device)
 
-    bbox_table = _load_bbox_table(source_dir) if args.mode in ('all', 'bbox') else None
-    landmark_table = _load_keypoint_table(source_dir) if args.mode in ('all', 'landmarks') else None
+    triangles = flame['triangles'].detach().cpu().numpy()
+    n_vertices = int(flame['v_template'].shape[0])
+
+    # Optional FLAME face-region restriction for mesh / wireframe.
+    face_mask = None
+    face_triangles = triangles
+    if args.face_only:
+        face_mask = _load_face_vertex_mask(n_vertices)
+        # keep only triangles whose three vertices are all in the face
+        # region (so the wireframe doesn't trail edges out to the ears)
+        keep = face_mask[triangles].all(axis=1)
+        face_triangles = triangles[keep]
+
+    draws_mesh = args.mode in ('all', 'mesh')
+    draws_wireframe = args.mode == 'wireframe'
+    # wireframe mode behaves like 'all' but swaps the mesh dots for
+    # triangle edges — so bbox / landmarks / params_card come along.
+    composite = args.mode in ('all', 'wireframe')
+    draws_bbox = composite or args.mode == 'bbox'
+    draws_landmarks = composite or args.mode == 'landmarks'
+    draws_params_card = composite or args.mode == 'params_card'
+    bbox_table = _load_bbox_table(source_dir) if draws_bbox else None
+    landmark_table = _load_keypoint_table(source_dir) if draws_landmarks else None
 
     mesh_color = tuple(int(c) for c in args.mesh_color.split(','))
     bbox_color = tuple(int(c) for c in args.bbox_color.split(','))
@@ -331,7 +418,7 @@ def main() -> None:
             skipped += 1
             continue
 
-        if args.mode in ('all', 'mesh'):
+        if draws_mesh or draws_wireframe:
             exp = _expand_expression(features, idx, args.n_expr, args.device)
             pose = _build_full_pose(features, idx, args.device)
             eyelid = torch.from_numpy(
@@ -346,26 +433,36 @@ def main() -> None:
                     flame, shape, exp, pose, eyelid, translation, flame_scale)
             v_np = v_world[0].detach().cpu().numpy().astype(np.float32)
             uv, _ = project(v_np, world_mat, intrinsics, image_w, image_h)
-            out = draw_vertices(
-                out, uv, mesh_color, args.vertex_radius, args.vertex_stride)
 
-        if args.mode in ('all', 'bbox') and bbox_table is not None:
+            if draws_wireframe:
+                out = _draw_wireframe(out, uv, face_triangles, mesh_color)
+            else:
+                # mesh dots; restrict to the face region if requested
+                if face_mask is not None:
+                    uv_draw = uv[face_mask]
+                else:
+                    uv_draw = uv
+                out = draw_vertices(
+                    out, uv_draw, mesh_color,
+                    args.vertex_radius, args.vertex_stride)
+
+        if draws_bbox and bbox_table is not None:
             key = _resolve_frame_basename(p, bbox_table)
             if key is not None:
                 x0, y0, x1, y1 = bbox_table[key]
                 cv2.rectangle(out, (x0, y0), (x1, y1), bbox_color, 1, cv2.LINE_AA)
 
-        if args.mode in ('all', 'landmarks') and landmark_table is not None:
+        if draws_landmarks and landmark_table is not None:
             key = _resolve_frame_basename(p, landmark_table)
             if key is not None:
                 lmk = landmark_table[key]
-                # Re-use demo_3 draw_landmarks (red dots) but with our own
-                # color via a single override below — demo_3 hardcodes red.
+                # demo_3's draw_landmarks hardcodes red; inline a draw
+                # loop so the colour is configurable.
                 for x, y in lmk:
                     cv2.circle(out, (int(round(float(x))), int(round(float(y)))),
                                2, landmark_color, -1, cv2.LINE_AA)
 
-        if args.mode in ('all', 'params_card'):
+        if draws_params_card:
             out = _draw_params_card(out, features, idx)
 
         writer.append_data(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
