@@ -22,51 +22,103 @@
 
 ---
 
-## 1. グランドデザインの理解（要確認）
+## 1. グランドデザインの理解（2026-05-16 ユーザー補足反映、要確認）
 
-`doc/preprocessing_scope.md` / `lhg/README.md` / 各 `*.py` の docstring と
-コミットメッセージ（"2026-05-14 / 2026-05-15 grand design"）から、本ブランチの
-設計意図を以下のように理解しました。**誤解があればご指摘ください。**
+`doc/preprocessing_scope.md` / `lhg/README.md` / 各 `*.py` の docstring・
+コミットメッセージに、**ユーザー補足（2026-05-16）**を加えて再構成した
+理解。ユーザーのコメント待ち。
 
-### 1.1 二つの独立パイプライン
+### 1.1 グランドデザイン＝LHG モデルにおける HRAvatar 利用のビジョン
 
-このリポジトリには出力フォーマットもアルゴリズム保証も異なる 2 つの
-前処理系が同居している:
+LHG（Listening Head Generation）モデルは、話し手に対する**聞き手の頭部
+動作を生成**する。モデルの入力は 2 系統:
 
-1. **HRAvatar アバター個人 fit**（1 被写体 1 回）— `tracked_params.json` +
-   matting + albedo を生成。clip 全体の joint Adam 最適化。
-2. **LHG (Listening Head Generation) 前処理** — LHG モデルが推論時に
-   生成すべき per-frame FLAME パラメータ列を作る。
-
-### 1.2 LHG 3-Stage 構成と責務分離
-
-| Stage | 役割 | アルゴリズム |
+| 入力 | 性質 | 必要な符号化 |
 |---|---|---|
-| **Stage 1** | clip 定数（`world_mat` / `shapecode` / `intrinsics`）の確定 | DECA `optimize.py` の clip-wide joint Adam fit |
-| **Stage 2** (`--mode online`) | per-frame FLAME 特徴量の **causal** 抽出 | detector → stable bbox → SMIRK → EPnP → causal Hampel → symmetric FIR LPF |
-| **Stage 3** (`--mode pseudo-online`) | teacher データ生成 | Stage 2 core + 双方向 Hampel + dropout 補間 + quaternion-flip + 大 lookahead LPF |
+| **話し手（speaker）の頭部動作** | ライブ。リアルタイムに取得が必須 | **オンライン経路**。厳密 causal・lookahead=0 が原則 |
+| **聞き手（listener）の頭部動作** | モデルが聞き手について**自己回帰**するためリアルタイム取得は不要 | **オフライン経路**。最大限最適化したデータを使える |
 
-### 1.3 設計の根本テーゼ
+HRAvatar は renderer とアバター個人 fit を提供し、LHG モデル出力（FLAME
+パラメータ）が HRAvatar アバターを駆動して聞き手頭部を描画する。
 
-- **per-frame EPnP は clip-wide joint fit の精度を再現できない**（精度差は
-  概ね 10×）。だから「無理に再現しない」。Stage 1 が**絶対 pose**を、
-  Stage 2 が**per-frame delta**を担当する分業。Stage 2/3 は Stage 1 の
-  per-frame 出力を**意図的に読まない**（clip 定数のみ読む）。
-- per-frame `global_rot` / `translation` は `world_mat` まわりの
-  **小さな delta** として出力する。LHG モデルには「絶対 pose」ではなく
-  「運動」だけを学習させる。
-- **clip 定数を最大化し、per-frame オンライン推定を最小化する**。
-- **train/inference の一致**: 抽出時に掛ける平滑化は必ず streaming 等価物を
-  持つ（`apply_offline_zero_phase` ⇔ `StreamingSymmetricFIR`、bit-exact）。
-- **teacher = renderer が実際に消費する値**。2026-05-14/15 の明確化で、
-  teacher の expression/jaw/eyelid は **アバター自身の学習済み SMIRK** を
-  224 crop に掛けた値とする。online と teacher は同じ SMIRK 重みを共有し、
-  両者の差は「online 固有の制約（causality・clip-wide joint 最適化の不在）」
-  のみであるべき。
-- expression/eyelid は LPF 対象外（lip-sync を壊すため）。jaw は opt-in。
-  LPF は `global_rot` / `translation` のみが基本対象。
-- LHG モデルは「online 入力」と「teacher 目標」の**差**を学習で吸収する。
-  この差は理想的には lookahead=0 で取りきれない jitter 程度に収まるべき。
+### 1.2 二つの符号化経路（用語の整理）
+
+| 経路 | 実体 | アルゴリズム |
+|---|---|---|
+| **オフライン経路** | Stage 1 DECA `optimize.py` clip-wide joint fit → `lhg/teacher.py` で `lhg_features.npz` 化 | clip 全体・双方向・未来可視を使い切る。**ゴールドスタンダード** |
+| **オンライン経路** | Stage 2（`extract` の `--mode online`） | detector → stable bbox → SMIRK → EPnP → causal Hampel → symmetric FIR LPF |
+
+> **`pseudo-online`（README で言う Stage 3）の扱いは不明確。** ユーザーに
+> よれば現行で使うのは「オフライン経路」と「オンライン経路」の 2 つで、
+> `pseudo-online` は古いコードの可能性があり立場が曖昧。本書は
+> `pseudo-online` を分析対象から外し、オフライン経路＝
+> `Stage 1 + lhg/teacher.py` として扱う。
+> （本書初版は `pseudo-online` を「teacher 生成」と誤同定していた — 訂正済み。）
+
+### 1.3 中核テーゼ — オンラインはオフラインの「制約付き複製」
+
+> **オンライン経路はオフライン経路と可能な限り同一にする。同一でないのは、
+> オンラインでアルゴリズム的に実装不可能な部分のみ。**
+
+理由: ① 話し手と聞き手の頭部動作は同一スキーマ・同一分布に乗らねば
+モデルが一貫処理できない。② 学習時は話し手も動画からオフライン符号化
+されるため、「学習時オフライン符号化の話し手」と「推論時オンライン
+符号化の話し手」が一致しないと **train/test 分布ミスマッチ**になる。
+
+online/offline の差として **「許される差」は 2 カテゴリ**ある
+（ユーザー補足 2026-05-16 で明確化）:
+
+**カテゴリ A — アルゴリズム的に不可能:**
+
+- clip-wide joint Adam 最適化（未来全体を見る）→ 不可能
+- 双方向フィルタ（未来フレーム参照）→ 不可能
+- per-frame Adam 最適化（リアルタイム予算超過）→ 不可能 ⇒ EPnP（1-shot
+  解析解）で代替
+- 任意 lookahead → 予算が許す範囲のみ
+
+**カテゴリ B — 意図的に取得要件を緩和したパラメータ:**
+
+実環境利用時に **カメラとユーザの位置関係を調整・キャリブレーション
+できる**場合や、**事前取得データを使い回せる**場合、無理にオンラインで
+取得すべきでないパラメータが存在する。それらは online で per-frame 推定
+**せず**、Stage 1 キャリブレーション／clip 定数／事前取得値を使う。
+
+> **重要**: カテゴリ B は「online でその値を出さなくてよい」という意味
+> ではなく「**online でその値を per-frame 推定しなくてよい — 代わりに
+> 較正済み clip 定数を使え**」という意味。**ゼロを出すのは誤り**。
+> 緩和の正しい実装は「Stage 1 / 事前取得の clip 定数を焼き込む」こと。
+
+**この 2 カテゴリ以外の online/offline の差はすべて「不当な乖離
+（＝バグ／設計違反）」**。本書 §3 の候補①②はこの「不当な乖離」、
+あるいは「カテゴリ B の緩和をゼロ出力で誤実装したもの」に該当する（後述）。
+
+### 1.4 派生する設計上の取り決め
+
+- per-frame EPnP は clip-wide joint fit の精度を再現できない（約 10× 差）。
+  → 絶対 pose は Stage 1（clip 定数）、per-frame delta は Stage 2 が担当。
+  per-frame `global_rot` / `translation` は `world_mat` まわりの小 delta。
+- **clip 定数を最大化し、per-frame オンライン推定を最小化する。**
+- 抽出時の平滑化は必ず streaming 等価物を持つ
+  （`apply_offline_zero_phase` ⇔ `StreamingSymmetricFIR`、bit-exact）。
+- **teacher = renderer が実消費する値**。teacher の expression/jaw/eyelid は
+  アバター自身の学習済み SMIRK を 224 crop に掛けた値。online も同じ
+  SMIRK 重みを共有する。
+- expression/eyelid は LPF 対象外（lip-sync 保護）。jaw は opt-in。LPF は
+  `global_rot` / `translation` が基本対象。
+
+### 1.5 未確定・注意点
+
+1. **lookahead**: 話し手は原則 lookahead=0 のはずだが、実装の online
+   デフォルトは `lpf_lookahead=4`（160ms、`lhg/config.py:110`）。
+   「lookahead>0 の将来余地」はパラメータとして実装に反映されているが、
+   デフォルト 4 は lookahead=0 ではない。会話ログの抽出が L=0 か L=4 かは
+   不明。
+2. **ゴールドスタンダード自体の品質**: 設計は「オフライン＝正解」を前提に
+   するが、ユーザー観察（FAN jitter、大ヨー overshoot、本書 §4・§5）は
+   オフライン経路自身に欠陥がある可能性を示す。online がオフラインより
+   良い側面があるなら、それは「online がオフラインに一致していない（乖離）」
+   と「正解側が不完全」の両方を意味する。**online を正解に合わせる前に
+   正解側（オフライン経路）の品質改善も課題**になり得る。
 
 ---
 
@@ -234,6 +286,72 @@ teacher(01) は同じ overlay で顔に整合するので投影系は正しい�
 **＝ A/B/C はいずれも候補①（neck=0）を直さない。** これが「全モデルで
 ずれが解消しない」ことの最有力説明。
 
+### 3.3 グランドデザイン上の位置づけ（2 カテゴリ・モデルで再評価）
+
+§1.3 の「許される差は カテゴリ A（アルゴリズム的に不可能）／カテゴリ B
+（意図的に緩和）の 2 つだけ」に照らすと:
+
+- **候補①（neck=0）**: neck は **カテゴリ B（緩和対象）**である公算が高い
+  — `pipeline.py:843` のコメント自身が「clip-baseline or supplied by a
+  different module」と書く。だが §1.3 の重要注記の通り、**緩和の正しい
+  実装は「Stage 1 / 事前取得の clip 定数 neck を焼き込む」ことであって、
+  ゼロを出すことではない**。現コードはゼロを出している → **カテゴリ B の
+  緩和をゼロ出力で誤実装したもの**。修正は任意改善ではなく設計遵守の
+  必須要件で、修正方向は「clip-baseline neck を焼き込む」。
+- **候補②（`R_ref^T` 欠落）**: 単なる座標変換の実装ミス。カテゴリ A にも
+  B にも当たらない → **純然たる不当な乖離＝グランドデザイン違反**。
+
+**候補③（EPnP 深度条件数）の再評価 — 重要**: 深度（translation z）は
+**カテゴリ B の有力候補**。ユーザー補足「カメラとユーザの位置関係を
+調整可能」はまさに**カメラ・ユーザ間距離（≒絶対深度）が較正可能**で
+あることを意味する。だとすれば:
+
+> 会話ログの候補 A／B／C／cam→z proxy は **「online で深度を正確に
+> 推定する」努力**だが、深度がカテゴリ B なら、この努力は設計趣旨から
+> 見て**部分的に方向違い**である。設計に沿った答えは「**深度を online で
+> EPnP 推定しない — Stage 1 較正の clip 定数深度を使う**」。EPnP の準平面
+> 16 点による深度の悪条件（§3.1 候補③）と systematic bias は、本来
+> 緩和すべきパラメータを無理に online 推定したことの症状とも解釈できる。
+
+ただし「深度が完全に clip 定数でよいか／ユーザの前後移動を live で取る
+必要があるか」は設計判断であり、ユーザー確認が必要（§7.1）。
+
+### 3.4 ユーザー追加観察（2026-05-16）と再評価
+
+ユーザー観察:
+- 可視化メッシュは顔のヨー回転に追従して向きを正しく変える（確認済み）。
+- 「数センチ浮いたお面」は、回転軸を顔と共有しつつメッシュが浮くため、
+  より大きい半径で動いて見える（「厳密未確認、そう見える」との見立て）。
+
+含意:
+
+1. **向き（`global_rot`）はほぼ正しい。** メッシュがヨーに追従する＝
+   EPnP の回転推定は機能。問題は純粋に**位置**。候補④（rotation bias）は
+   本症状の主因でないことがさらに裏付けられる。
+2. **「より大きい半径」は 2D 投影効果として最も自然に説明できる。**
+   メッシュがカメラに数 cm 近く描画されると投影スケールが増し、同じヨー角
+   でも像面上の掃引が大きくなる（pixels-per-cm 増）。＝核心的事実は
+   「**メッシュが実顔より一定量カメラ寄りに描画されている**」。
+3. **消去法**: A 後も残る・無傾き・一定 の位置誤差は、(a) A が触れない
+   チャンネルで、かつ (b) `global_rot` ではない（傾くため）もの。該当は
+   `neck_pose`（online=0, teacher≠0）のみ → 候補① を消去法的に支持。
+4. **正直な留保**: ただし neck=0 が「カメラ寄りの浮き」を生むという符号
+   までは FLAME を実行せずに確証できない（首の習慣姿勢と関節幾何に依存。
+   純ヨーでは neck/head 関節が縦軸をほぼ共有するため neck=0 は半径を
+   ほとんど変えず、neck は主にピッチに効く）。本症状が純粋にヨー連動なら
+   neck=0 単独では不足で、候補②（translation 座標系）・③（深度）が
+   併存している可能性が高い。
+
+**判別テスト（GPU 復帰時、1 観察で切り分け可能）:**
+- 大きくヨーした（〜45°）フレームで、メッシュの浮きの向きは
+  「**カメラ方向**（カメラ系一定）」か「**鼻の前方向**（頭部系一定）」か。
+  - カメラ系 → 候補②（translation 座標系不整合）・③（EPnP 深度）。
+  - 頭部系 → 候補①（neck）または pose の pivot 誤り。
+- あわせて、A の offset 計算（`lhg/pipeline.py:826-841` が
+  `tracked_params.json` の全画像キーを読む）が、抽出クリップとフレーム数・
+  範囲が一致しているか確認。不一致なら A の平均がずれ、定数残差を残す
+  （＝「A で数値ゼロのはずが見た目ずれたまま」の別経路の説明になり得る）。
+
 ---
 
 ## 4. 問題B: オフライン経路の方が jitter が多い
@@ -330,12 +448,14 @@ online が C 問題で勝ち A 問題（深度・並進）で負けるのは同�
 
 優先度順:
 
-1. **候補①の検証・修正（最優先）**: online 経路の `neck_pose`（および
-   `eye_pose`）に **Stage 1 由来の clip-baseline 値**（例: DECA optimize の
-   per-frame neck の clip 平均）を焼き込む。`lhg/pipeline.py:849` のゼロ
-   出力を、`calibration` から取った clip 定数 neck に置き換える。これは
-   §1.3「clip 定数を最大化」テーゼに沿う。修正後、teacher と online の
-   overlay を再比較し「お面浮き」が消えるか確認。
+0. **設計判断の確定（最優先・コード変更前）**: どのパラメータがカテゴリ B
+   （緩和対象）かを確定する（§7.1）。特に `neck` / `eye` / **translation z
+   (深度)** の扱い。これが決まらないと 1・4 の修正方針が定まらない。
+1. **候補①の修正**: online 経路の `neck_pose`（および `eye_pose`）の
+   ゼロ出力（`lhg/pipeline.py:849`）を、**Stage 1 / 事前取得の clip 定数
+   neck**（例: DECA optimize の per-frame neck の clip 平均）に置き換える。
+   これがカテゴリ B 緩和の正しい実装。修正後、teacher と online の overlay
+   を再比較し「お面浮き」が消えるか確認。
 2. **検証手法の是正**: overlay 比較は teacher(neck≠0) vs online(neck=0) で
    非対称になっている。当面は online overlay を「teacher の neck を借りて」
    描くか、両者とも neck=0 で描くと、neck 以外の差（②③④）が切り分け
@@ -343,8 +463,11 @@ online が C 問題で勝ち A 問題（深度・並進）で負けるのは同�
 3. **候補②の検証・修正**: `tracked_params.json` の `world_mat` 回転成分を
    測り、単位行列から数度以上ずれていれば `_recenter_against_world_mat`
    の translation を `R_ref^T @ (translations − t_ref)` に修正。
-4. **候補③への対処**: EPnP に深度を安定させる点（顎・鼻先など前後に
-   厚みを出す点）を追加するか、深度のみ別系統で推定。
+4. **候補③＝深度の扱い**: 深度がカテゴリ B なら、EPnP の深度を補強する
+   のではなく **online で深度推定をやめ、Stage 1 較正の clip 定数深度を
+   使う**（会話ログの A/B/C/cam→z proxy は不要になる）。深度を live で
+   取る必要があると判断するなら、EPnP に前後に厚みのある点（顎・鼻先）を
+   足すか別系統で安定化。**0 番の設計判断に従う。**
 5. **問題C（§7 要確認①）**: `preprocess/submodules/DECA/optimize.py` を
    チェックアウトして時間正則化の階数を確認。
 
@@ -367,3 +490,28 @@ online が C 問題で勝ち A 問題（深度・並進）で負けるのは同�
    赤点（FAN 68pt）が顔から外れるフレームで崩れるか、赤点は顔に乗って
    いるのにメッシュだけ逸れるか。前者なら検出器側（C-1）、後者は
    最適化側（C-2/C-3）。
+
+### 7.1 グランドデザインの理解についての確認（§1 の妥当性）
+
+§1 はユーザー補足（2026-05-16）を反映して再構成したが、以下が未確定:
+
+4. **オフライン経路の実体** — 「Stage 1 DECA `optimize.py` ＋
+   `lhg/teacher.py`」で合っているか。
+5. **train/inference の対応** — 学習時は話し手チャンネルもオフライン
+   符号化、推論時のみオンライン符号化、という対応で合っているか
+   （＝ online が offline に一致すべき根拠）。
+6. **`pseudo-online`（Stage 3）の現況** — 完全に未使用の旧コードか、
+   将来有効化予定のものか。本書は分析対象から外している。
+7. **話し手アバターと聞き手アバターの異同** — 同一アバターか別か
+   （teacher の avatar-SMIRK 重みの扱いに影響）。
+8. **カテゴリ B（緩和対象）パラメータの確定（最重要）** — どのチャンネルを
+   「online で per-frame 推定せず Stage 1 / 事前取得の clip 定数を使う」
+   と意図しているか。具体的に:
+   - `neck_pose` / `eye_pose` はカテゴリ B か（＝ clip 定数 neck を焼き込む
+     のが正しい実装か）。
+   - **translation z（カメラ・ユーザ間の絶対深度）はカテゴリ B か。**
+     カテゴリ B なら、会話ログの候補 A/B/C・cam→z proxy は設計趣旨に
+     対して方向違いで、「較正 clip 定数の深度を使う」が正解になる。
+     ユーザの前後移動を live で取りたい場合はカテゴリ B から外れる。
+   - `world_mat` / `shapecode` / `intrinsics` は既にカテゴリ B（clip 定数）
+     という理解で合っているか。
