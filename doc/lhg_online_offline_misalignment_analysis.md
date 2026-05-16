@@ -515,3 +515,148 @@ online が C 問題で勝ち A 問題（深度・並進）で負けるのは同�
      ユーザの前後移動を live で取りたい場合はカテゴリ B から外れる。
    - `world_mat` / `shapecode` / `intrinsics` は既にカテゴリ B（clip 定数）
      という理解で合っているか。
+
+---
+
+## 8. 添付実装プラン（neck-slot-rotation）の評価
+
+2026-05-16、マシン一時復旧中の追加調査に基づくユーザー作成プラン
+（`stage11jigglyhoney.md`、以下「プラン」）を評価する。
+
+### 8.1 結論（先に）
+
+**プランの中核診断は妥当で、本書の候補 A/B/C や本書初出の候補①
+（neck=0）より本質的。** EPnP の回転を「どの pose スロットに入れるか」で
+回転中心が変わり、その**回転中心ずれ `(I−R)@J` を並進で相殺していない**
+ことが浮きの主因、という診断は正しい方向。per-frame 閉形式で causal に
+補正できるという指摘も正しい。
+
+ただし**重大な技術的欠落が 1 点、設計上の留保が 1 点**ある（8.3 / 8.4）。
+
+### 8.2 プランの診断の検証（コード読解で確認）
+
+`scene/gaussian_head_model.py:lbs_v2`（239-301）と
+`scene/flame.py:batch_rigid_transform`（663-693）を精読し、FLAME の
+関節回転規約を確認した:
+
+- `batch_rigid_transform` の `joints_homogen` は `F.pad(joints,[0,0,0,1])`
+  ＝ 4 要素目は **0**。これにより各関節の LBS 行列は
+  `A_k = [[R, (I−R)@J[k]],[0,1]]` となり、関節 k の回転は
+  **`R@(v−J[k]) + J[k]`（J[k] を固定点とする回転）**。rest（R=I）で
+  `A_k = I` ＝ rest pose が v_template に一致（規約として正しい）。
+- EPnP は object_points（FLAME 標準座標の landmark）に対し
+  `p_cam = R_e@p_obj + t_e` ＝ **原点まわりの回転**。
+- renderer がスロット k に回転を入れると landmark は
+  `R@(p_obj−J[k]) + J[k]` を経由 → EPnP の `R@p_obj` との差は
+  `(I−R)@J[k]`。
+
+→ **プランの式 `t − (I−R)@J` は、この「J 固定回転」規約と構造的に
+一致する。式の形は正しい。** （`pose blendshape` が関節 1 以降のみに
+効くという §2-2 の記述も `lbs_v2:276` で確認、正しい。）
+
+### 8.3 問題点①【HIGH】— `world_mat` 回転 `R_ref` の省略
+
+プランは `t_neck` を `per_frame_core` 内で **生の EPnP 出力 `R_e, t_e`
+（カメラ系）** に対して計算し、`_recenter_against_world_mat` は
+「無改修で動作」とする。しかし `_recenter` は並進について
+`translations − t_ref` の**単純減算のみ**で、回転 `R_ref` を掛けない
+（本書 §3.1 候補②）。
+
+renderer の合成（スロット k、world_mat 込み）を厳密に解くと、正しい
+最終並進は:
+
+```
+translation_final = R_ref^T @ (t_e − t_ref) − (I − R_pose) @ J[k]
+                     （R_pose = R_ref^T @ R_e、FLAME 系の回転）
+```
+
+プランの実装（per_frame_core で `t_e−(I−R_e)@J[1]` → `_recenter` が
+`−t_ref`）が出す最終並進との差は:
+
+```
+残差 = (I − R_ref^T) @ [ (t_e − t_ref) + R_e @ J[1] ]
+```
+
+→ **プランの式が厳密に正しいのは `R_ref ≈ I`（world_mat の回転成分が
+ほぼ単位行列）のときだけ。** world_mat が非自明な回転を持つ場合、上記
+残差が残る。また joint 項を**カメラ系の `R_e`** で計算している点も
+不整合（J[k] は FLAME 系の量なので、FLAME 系の `R_pose` を使うべき）。
+
+**推奨**:
+- 先に `tracked_params.json` の `world_mat[:3,:3]` を測り、単位行列からの
+  乖離（軸角換算）を確認する。
+- 乖離が無視できないなら、joint 補正は **`_recenter` の後・FLAME 系**で、
+  `R_pose` を使って `translation_final = R_ref^T@(t_e−t_ref) −
+  (I−R_pose)@J[k]` として適用する。プランの「`_recenter` 無改修」は
+  この場合**成り立たない** — `_recenter` 側に `R_ref^T` を入れる
+  （本書 §3 候補②の修正）必要がある。
+
+### 8.4 問題点②【HIGH・グランドデザイン】— online と teacher の表現不一致
+
+プランは EPnP の**総回転**を neck スロットに入れ、global スロットを 0 に
+する。一方 teacher（オフライン経路）は DECA optimize が回転を
+**global（平均 9.8°）＋ neck（平均 20.5°）に分割**して持つ。
+
+LHGFeatures スキーマは不変なので、LHG モデルが見る値は:
+- online: `global_rot` フィールド＝総回転、`neck_pose`＝0（render_adapter で
+  neck スロットに移すのは renderer 用変換のみ）
+- teacher: `global_rot`＝小、`neck_pose`＝中
+
+→ **同じ物理回転が online と teacher で別の数値分解になる。** §1.3 の
+中核テーゼ「online は offline と同一であるべき」に反する乖離。プランは
+§7 で「online/teacher のスキーマ完全統一は検証後に別途検討」と先送り
+するが、これは単なる整理ではなく**グランドデザイン上の本質的論点**。
+
+**推奨**: レンダリング検証が通っても、LHG モデル学習の前に「global/neck
+の分解規約を online と teacher で統一する」決定を行う。EPnP は分解を
+出せない（総回転しか出ない）ので、teacher 側も同じ単一スロット表現に
+畳むか、両者を正準表現に揃える設計判断が要る。
+
+### 8.5 問題点③【MEDIUM】— pose blendshape の過剰適用
+
+neck スロットに総回転を入れると、neck の pose blendshape が**総回転
+ぶん**効く。teacher は neck 部分回転ぶんしか効かせていない。アバターは
+teacher の分割で学習済みなので、(global=0, neck=総回転) は学習時と
+異なる neck 変形を renderer に与える。二次的影響だが、8.4 の表現不一致の
+一側面。プランの 2x2 動画での主観評価で観察すべき。
+
+### 8.6 問題点④【LOW-MEDIUM】— §6「再学習不要」の実効回転見積り
+
+プラン §6 は実効回転を「おおむね 10〜30°」とし neck 学習分布
+（最大 61.5°）内に収まるとする。しかし online neck に入るのは
+**総頭部姿勢**（teacher の global∘neck の合成相当）。neck 単独で最大
+61.5°、global が最大 30° なら、合成総回転は 61.5° を超え得る。
+§9 自身が「最大級横向きで 61° 超過の破綻可能性」を挙げており、§6 の
+「10〜30°」と不整合。**実効回転は teacher の global∘neck 合成として
+見積もり直すべき。**
+
+### 8.7 検証手順の強化提案
+
+プランの Step 3（2x2 動画・主観評価）と Step 4（teacher 差の平均/標準
+偏差分解）は妥当。ただし**式の誤りは主観評価では検出しにくい**ので、
+その前に**1 フレーム数値リプロジェクションチェック**を追加することを
+強く推奨:
+
+> 1 フレームについて、新方式で組んだ FLAME mesh を `project()` で 2D 化し、
+> EPnP に入力した 2D landmark とサブピクセル一致するか確認する。一致
+> しなければ式（8.3 の `R_ref` 含む）が誤っている。これは GPU 1 フレーム
+> 分で済み、主観評価の前に式の正否を確定できる。
+
+### 8.8 スコープの確認
+
+プランは**問題 A（online のメッシュずれ）専用**。本書 §4（オフライン
+経路の jitter）・§5（大ヨー overshoot）は**プランの対象外**で、別途
+残る課題である。
+
+### 8.9 本書 候補①（neck=0）の訂正
+
+プランの joint-center 診断を採用し、**本書 §3 の候補①「online が
+`neck_pose`=0 であること自体が主因／clip-baseline neck を焼き込むのが
+修正」という見立ては撤回する。** 候補① は「neck スロット／回転中心が
+関係する」ことは捉えていたが、機構の理解が浅く、提案した修正
+（clip-baseline neck を足す）は誤り（per-frame の回転中心ずれを直さない）。
+正しい機構と修正はプラン＋本書 8.3 の `R_ref` 補正である。
+
+なお「online と teacher で neck 表現が食い違う」という候補① の観察自体は
+**8.4（表現不一致）として生き残る** — プラン後も online neck=総回転 /
+teacher neck=部分回転 で食い違うため。
